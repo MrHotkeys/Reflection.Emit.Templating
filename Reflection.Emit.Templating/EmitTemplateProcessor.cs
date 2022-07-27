@@ -1,12 +1,12 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.IO;
-using System.Threading.Tasks;
 using System.Reflection;
 using System.Reflection.Emit;
 
 using Microsoft.Extensions.Logging;
+
+using MrHotkeys.Reflection.Emit.Templating.Cil;
+using MrHotkeys.Reflection.Emit.Templating.Cil.Instructions;
 
 namespace MrHotkeys.Reflection.Emit.Templating
 {
@@ -14,272 +14,44 @@ namespace MrHotkeys.Reflection.Emit.Templating
     {
         private ILogger Logger { get; }
 
-        private Dictionary<short, OpCode> OpCodeLookup { get; }
+        private ICilParser CilParser { get; }
 
-        public EmitTemplateProcessor(ILogger<EmitTemplateProcessor> logger)
+        private ICilWriter CilWriter { get; }
+
+        public EmitTemplateProcessor(ILogger<EmitTemplateProcessor> logger, ICilParser cilParser, ICilWriter cilWriter)
         {
             Logger = logger ?? throw new ArgumentNullException(nameof(logger));
-
-            OpCodeLookup = typeof(OpCodes)
-                .GetFields()
-                .Select(f => f.GetValue(null))
-                .Cast<OpCode>()
-                .ToDictionary(c => c.Value);
+            CilParser = cilParser ?? throw new ArgumentNullException(nameof(cilParser));
+            CilWriter = cilWriter ?? throw new ArgumentNullException(nameof(cilWriter));
         }
 
-        public void Process(ILGenerator outIL, bool outIsStatic, Func<EmitTemplateSurrogate, Delegate> callback)
+        public void Process(TypeBuilder typeBuilder, ILGenerator il, bool outIsStatic, Func<EmitTemplateSurrogate, Delegate> callback)
         {
             var template = callback(EmitTemplateSurrogate.Instance);
-            var templateInfo = template.GetMethodInfo();
-            var templateBody = templateInfo.GetMethodBody() ?? throw new InvalidOperationException();
-            var templateIL = (ReadOnlySpan<byte>)templateBody.GetILAsByteArray().AsSpan();
+            var context = new Context(
+                typeBuilder: typeBuilder,
+                callback: callback,
+                template: template,
+                templateBody: CilParser.ParseMethodBody(template.Method),
+                argumentIndexOffset: GetArgIndexOffset(template.Method.IsStatic, outIsStatic));
 
-            var captureLookup = new Dictionary<MemberInfo, object?>();
             if (callback.Target is not null)
-                AddCaptures(callback.Target, captureLookup);
+                AddCaptures(callback.Target, context.Captures);
             if (template.Target is not null)
-                AddCaptures(template.Target, captureLookup);
+                AddCaptures(template.Target, context.Captures);
 
-            var localLookup = new Dictionary<int, LocalBuilder>(templateBody.LocalVariables.Count);
-            foreach (var localIn in templateBody.LocalVariables)
+            for (var i = 0; i < context.TemplateBody.Tokens.Count; i++)
             {
-                var localBuilder = outIL.DeclareLocal(localIn.LocalType);
-                localLookup.Add(localIn.LocalIndex, localBuilder);
+                var token = context.TemplateBody.Tokens[i];
+                ProcessToken(context, ref i, token);
             }
 
-            var argIndexOffset = GetArgIndexOffset(templateInfo.IsStatic, outIsStatic);
+            context.TemplateBody.Tokens = context.Pop();
 
-            var contextStack = new Stack<List<Action>>();
-            var memberStack = new Stack<MemberInfo>();
-            var lastBytesLength = templateIL.Length;
-            var bytesRead = 0;
-            while (templateIL.Length > 1) // Skip final ret
-            {
-                var opCode = ParseOpCode(ref templateIL);
-                var opCodeName = (OpCodeName)opCode.Value;
+            if (context.TemplateBody.Tokens[^1] is ICilInstruction lastInstruction && lastInstruction.InstructionType == CilInstructionType.Return)
+                context.TemplateBody.Tokens.RemoveAt(context.TemplateBody.Tokens.Count - 1);
 
-                bytesRead += lastBytesLength - templateIL.Length;
-                lastBytesLength = templateIL.Length;
-
-                switch (opCodeName)
-                {
-                    case OpCodeName.Ldarg_0 when (!templateInfo.IsStatic):
-                        EmitCapturesAccess(outIL, ref templateIL, callback, templateInfo, captureLookup, memberStack, contextStack);
-                        break;
-
-                    case OpCodeName.Call:
-                    case OpCodeName.Callvirt:
-                    case OpCodeName.Calli:
-                        EmitCall(outIL, opCode, ref templateIL, templateInfo.Module, memberStack, contextStack);
-                        break;
-
-                    case OpCodeName.Ldarg_0:
-                        EmitLdarg(outIL, 0 + argIndexOffset);
-                        break;
-                    case OpCodeName.Ldarg_1:
-                        EmitLdarg(outIL, 0 + argIndexOffset);
-                        break;
-                    case OpCodeName.Ldarg_2:
-                        EmitLdarg(outIL, 0 + argIndexOffset);
-                        break;
-                    case OpCodeName.Ldarg_3:
-                        EmitLdarg(outIL, 0 + argIndexOffset);
-                        break;
-                    case OpCodeName.Ldarg_S:
-                        EmitLdarg(outIL, ParseOperandByte(ref templateIL) + argIndexOffset);
-                        break;
-                    case OpCodeName.Ldarg:
-                        EmitLdarg(outIL, ParseOperandInt(ref templateIL) + argIndexOffset);
-                        break;
-
-                    case OpCodeName.Starg_S:
-                        EmitStarg(outIL, ParseOperandByte(ref templateIL) + argIndexOffset);
-                        break;
-                    case OpCodeName.Starg:
-                        EmitStarg(outIL, ParseOperandInt(ref templateIL) + argIndexOffset);
-                        break;
-
-                    case OpCodeName.Ldarga_S:
-                        EmitLdarga(outIL, ParseOperandByte(ref templateIL) + argIndexOffset);
-                        break;
-                    case OpCodeName.Ldarga:
-                        EmitLdarga(outIL, ParseOperandInt(ref templateIL) + argIndexOffset);
-                        break;
-
-                    case OpCodeName.Ldloc_0:
-                        EmitLdloc(outIL, localLookup[0]);
-                        break;
-                    case OpCodeName.Ldloc_1:
-                        EmitLdloc(outIL, localLookup[1]);
-                        break;
-                    case OpCodeName.Ldloc_2:
-                        EmitLdloc(outIL, localLookup[2]);
-                        break;
-                    case OpCodeName.Ldloc_3:
-                        EmitLdloc(outIL, localLookup[3]);
-                        break;
-                    case OpCodeName.Ldloc_S:
-                        EmitLdloc(outIL, localLookup[ParseOperandByte(ref templateIL)]);
-                        break;
-                    case OpCodeName.Ldloc:
-                        EmitLdloc(outIL, localLookup[ParseOperandInt(ref templateIL)]);
-                        break;
-
-                    case OpCodeName.Stloc_0:
-                        EmitStloc(outIL, localLookup[0]);
-                        break;
-                    case OpCodeName.Stloc_1:
-                        EmitStloc(outIL, localLookup[1]);
-                        break;
-                    case OpCodeName.Stloc_2:
-                        EmitStloc(outIL, localLookup[2]);
-                        break;
-                    case OpCodeName.Stloc_3:
-                        EmitStloc(outIL, localLookup[3]);
-                        break;
-                    case OpCodeName.Stloc_S:
-                        EmitStloc(outIL, localLookup[ParseOperandByte(ref templateIL)]);
-                        break;
-                    case OpCodeName.Stloc:
-                        EmitStloc(outIL, localLookup[ParseOperandInt(ref templateIL)]);
-                        break;
-
-                    default:
-                        EmitAsIs(outIL, opCode, templateIL, templateInfo.Module);
-                        break;
-                }
-            }
-        }
-
-        private void EmitCapturesAccess(ILGenerator outIL, ref ReadOnlySpan<byte> templateIL,
-            Delegate callback, MethodInfo templateInfo, Dictionary<MemberInfo, object?> captureLookup, Stack<MemberInfo> memberStack, Stack<List<Action>> contextStack)
-        {
-            // If here, we're loading outer capture
-            if (templateIL[0] == OpCodes.Ldfld.Value)
-            {
-                templateIL = templateIL.Slice(1);
-                var token = ParseOperandInt(ref templateIL);
-
-                var field = templateInfo
-                    .Module
-                    .ResolveField(token)
-                    ?? throw new InvalidOperationException();
-
-                if (field.FieldType == typeof(EmitTemplateSurrogate))
-                {
-                    contextStack.Push(new List<Action>());
-                }
-                else
-                {
-                    // Check if we're in outer or inner capture
-                    if (field.FieldType == callback.Target?.GetType())
-                    {
-                        // Load inner capture from outer capture
-                        if (templateIL[0] != OpCodes.Ldfld.Value)
-                            throw new InvalidOperationException();
-
-                        templateIL = templateIL.Slice(1);
-                        token = ParseOperandInt(ref templateIL);
-
-                        field = templateInfo
-                            .Module
-                            .ResolveField(token)
-                            ?? throw new InvalidOperationException();
-                    }
-
-                    if (field.DeclaringType != callback.Target?.GetType())
-                        throw new InvalidOperationException();
-
-                    var capture = captureLookup[field];
-
-                    if (capture is MemberInfo)
-                    {
-
-                    }
-                }
-            }
-            else
-            {
-                throw new InvalidOperationException();
-            }
-        }
-
-        // private void EmitLdfld(ILGenerator outIL, OpCode templateOpCode, ref ReadOnlySpan<byte> templateIL,
-        //     Module templateModule, Dictionary<MemberInfo, object?> captureLookup, Stack<MemberInfo> memberStack)
-        // {
-        //     var field = ParseOperandField(ref templateIL, templateModule);
-        //     if (field.)
-
-        // }
-
-        private void EmitCall(ILGenerator outIL, OpCode templateOpCode, ref ReadOnlySpan<byte> templateIL,
-            Module templateModule, Stack<MemberInfo> memberStack, Stack<List<Action>> contextStack)
-        {
-            var method = (MethodInfo)ParseOperandMethod(ref templateIL, templateModule);
-            if (method.Name == nameof(EmitTemplateSurrogate.Get))
-            {
-                var context = contextStack.Pop();
-                foreach (var action in context)
-                    action();
-
-                var member = memberStack.Pop();
-                switch (member.MemberType)
-                {
-                    case MemberTypes.Field when member is FieldInfo field:
-                        outIL.Emit(OpCodes.Ldfld, field);
-                        break;
-                    case MemberTypes.Property when member is PropertyInfo property:
-                        outIL.Emit(OpCodes.Callvirt, property.GetMethod);
-                        break;
-                    default:
-                        throw new Exception();
-                }
-            }
-            else if (method.Name == nameof(EmitTemplateSurrogate.Set))
-            {
-                var context = contextStack.Pop();
-                foreach (var action in context)
-                    action();
-
-                var member = memberStack.Pop();
-                switch (member.MemberType)
-                {
-                    case MemberTypes.Field when member is FieldInfo field:
-                        outIL.Emit(OpCodes.Stfld, field);
-                        break;
-                    case MemberTypes.Property when member is PropertyInfo property:
-                        outIL.Emit(OpCodes.Callvirt, property.SetMethod);
-                        break;
-                    default:
-                        throw new Exception();
-                }
-            }
-            else if (method.Name == nameof(EmitTemplateSurrogate.Call))
-            {
-                var context = contextStack.Pop();
-                foreach (var action in context)
-                    action();
-
-                var capturedMethod = (MethodInfo)memberStack.Pop();
-                if (capturedMethod.IsVirtual || capturedMethod.IsAbstract)
-                    outIL.Emit(OpCodes.Callvirt, capturedMethod);
-                else
-                    outIL.Emit(OpCodes.Call, capturedMethod);
-            }
-            else
-            {
-                EmitAndTrace(outIL, templateOpCode, method);
-            }
-        }
-
-        private int GetArgIndexOffset(bool templateIsStatic, bool destinationIsStatic)
-        {
-            if (templateIsStatic == destinationIsStatic)
-                return 0;
-            else if (templateIsStatic)
-                return -1;
-            else
-                return 1;
+            CilWriter.Write(il, context.TemplateBody);
         }
 
         private void AddCaptures(object target, Dictionary<MemberInfo, object?> captures)
@@ -303,351 +75,294 @@ namespace MrHotkeys.Reflection.Emit.Templating
             }
         }
 
-        private OpCode ParseOpCode(ref ReadOnlySpan<byte> bytes)
+        private int GetArgIndexOffset(bool templateIsStatic, bool destinationIsStatic)
         {
-            var key = (short)bytes[0];
-            if (key != 0xFE)
-            {
-                bytes = bytes.Slice(1);
-            }
+            if (templateIsStatic == destinationIsStatic)
+                return 0;
+            else if (templateIsStatic)
+                return 1;
             else
+                return -1;
+        }
+
+        private void ProcessToken(Context context, ref int index, ICilToken token)
+        {
+            switch (token.TokenType)
             {
-                key = unchecked((short)((key << 8) + bytes[1]));
-                bytes = bytes.Slice(2);
-            }
-
-            return OpCodeLookup.TryGetValue(key, out var opCode) ?
-                opCode :
-                throw new InvalidOperationException();
-        }
-
-        private byte ParseOperandByte(ref ReadOnlySpan<byte> templateIL)
-        {
-            var value = templateIL[0];
-            templateIL = templateIL.Slice(sizeof(byte));
-            return value;
-        }
-
-        private sbyte ParseOperandSByte(ref ReadOnlySpan<byte> templateIL)
-        {
-            var value = unchecked((sbyte)templateIL[0]);
-            templateIL = templateIL.Slice(sizeof(sbyte));
-            return value;
-        }
-
-        private ushort ParseOperandUShort(ref ReadOnlySpan<byte> templateIL)
-        {
-            var value = BitConverter.ToUInt16(templateIL);
-            templateIL = templateIL.Slice(sizeof(ushort));
-            return value;
-        }
-
-        private int ParseOperandInt(ref ReadOnlySpan<byte> templateIL)
-        {
-            var value = BitConverter.ToInt32(templateIL);
-            templateIL = templateIL.Slice(sizeof(int));
-            return value;
-        }
-
-        private uint ParseOperandUInt(ref ReadOnlySpan<byte> templateIL)
-        {
-            var value = BitConverter.ToUInt32(templateIL);
-            templateIL = templateIL.Slice(sizeof(uint));
-            return value;
-        }
-
-        private long ParseOperandLong(ref ReadOnlySpan<byte> templateIL)
-        {
-            var value = BitConverter.ToInt64(templateIL);
-            templateIL = templateIL.Slice(sizeof(long));
-            return value;
-        }
-
-        private float ParseOperandFloat(ref ReadOnlySpan<byte> templateIL)
-        {
-            var value = BitConverter.ToSingle(templateIL);
-            templateIL = templateIL.Slice(sizeof(float));
-            return value;
-        }
-
-        private double ParseOperandDouble(ref ReadOnlySpan<byte> templateIL)
-        {
-            var value = BitConverter.ToDouble(templateIL);
-            templateIL = templateIL.Slice(sizeof(double));
-            return value;
-        }
-
-        private string ParseOperandString(ref ReadOnlySpan<byte> templateIL, Module module)
-        {
-            var token = BitConverter.ToInt32(templateIL);
-            templateIL = templateIL.Slice(sizeof(int));
-            return module.ResolveString(token);
-        }
-
-        private Type ParseOperandType(ref ReadOnlySpan<byte> templateIL, Module module)
-        {
-            var token = BitConverter.ToInt32(templateIL);
-            templateIL = templateIL.Slice(sizeof(int));
-            return module.ResolveType(token);
-        }
-
-        private FieldInfo ParseOperandField(ref ReadOnlySpan<byte> templateIL, Module module)
-        {
-            var token = BitConverter.ToInt32(templateIL);
-            templateIL = templateIL.Slice(sizeof(int));
-            return module.ResolveField(token);
-        }
-
-        private MethodBase ParseOperandMethod(ref ReadOnlySpan<byte> templateIL, Module module)
-        {
-            var token = BitConverter.ToInt32(templateIL);
-            templateIL = templateIL.Slice(sizeof(int));
-            return module.ResolveMethod(token);
-        }
-
-        private byte[] ParseOperandSignature(ref ReadOnlySpan<byte> templateIL, Module module)
-        {
-            var token = BitConverter.ToInt32(templateIL);
-            templateIL = templateIL.Slice(sizeof(int));
-            return module.ResolveSignature(token);
-        }
-
-        private void EmitLdarg(ILGenerator outIL, int index)
-        {
-            switch (index)
-            {
-                case 0:
-                    EmitAndTrace(outIL, OpCodes.Ldarg_0);
-                    break;
-                case 1:
-                    EmitAndTrace(outIL, OpCodes.Ldarg_1);
-                    break;
-                case 2:
-                    EmitAndTrace(outIL, OpCodes.Ldarg_2);
-                    break;
-                case 3:
-                    EmitAndTrace(outIL, OpCodes.Ldarg_3);
-                    break;
-                default:
-                    if (index < byte.MaxValue)
-                        EmitAndTrace(outIL, OpCodes.Ldarg_S, (byte)index);
-                    else if (index > 0)
-                        EmitAndTrace(outIL, OpCodes.Ldarg, index);
-                    else
-                        throw new InvalidOperationException();
-                    break;
-            }
-        }
-
-        private void EmitStarg(ILGenerator outIL, int index)
-        {
-            if (index < byte.MaxValue)
-                EmitAndTrace(outIL, OpCodes.Starg_S, (byte)index);
-            else if (index > 0)
-                EmitAndTrace(outIL, OpCodes.Starg, index);
-            else
-                throw new InvalidOperationException();
-        }
-
-        private void EmitLdarga(ILGenerator outIL, int index)
-        {
-            if (index < byte.MaxValue)
-                EmitAndTrace(outIL, OpCodes.Ldarga_S, (byte)index);
-            else if (index > 0)
-                EmitAndTrace(outIL, OpCodes.Ldarg, index);
-            else
-                throw new InvalidOperationException();
-        }
-
-        private void EmitLdloc(ILGenerator outIL, LocalBuilder local)
-        {
-            var index = local.LocalIndex;
-            switch (index)
-            {
-                case 0:
-                    EmitAndTrace(outIL, OpCodes.Ldloc_0);
-                    break;
-                case 1:
-                    EmitAndTrace(outIL, OpCodes.Ldloc_1);
-                    break;
-                case 2:
-                    EmitAndTrace(outIL, OpCodes.Ldloc_2);
-                    break;
-                case 3:
-                    EmitAndTrace(outIL, OpCodes.Ldloc_3);
-                    break;
-                default:
-                    if (index < byte.MaxValue)
-                        EmitAndTrace(outIL, OpCodes.Ldloc_S, (byte)index);
-                    else if (index > 0)
-                        EmitAndTrace(outIL, OpCodes.Ldloc, index);
-                    else
-                        throw new InvalidOperationException();
-                    break;
-            }
-        }
-
-        private void EmitStloc(ILGenerator outIL, LocalBuilder local)
-        {
-            var index = local.LocalIndex;
-            switch (index)
-            {
-                case 0:
-                    EmitAndTrace(outIL, OpCodes.Stloc_0);
-                    break;
-                case 1:
-                    EmitAndTrace(outIL, OpCodes.Stloc_1);
-                    break;
-                case 2:
-                    EmitAndTrace(outIL, OpCodes.Stloc_2);
-                    break;
-                case 3:
-                    EmitAndTrace(outIL, OpCodes.Stloc_3);
-                    break;
-                default:
-                    if (index < byte.MaxValue)
-                        EmitAndTrace(outIL, OpCodes.Stloc_S, (byte)index);
-                    else if (index > 0)
-                        EmitAndTrace(outIL, OpCodes.Stloc, index);
-                    else
-                        throw new InvalidOperationException();
-                    break;
-            }
-        }
-
-        private void EmitAsIs(ILGenerator outIL, OpCode templateOpCode, ReadOnlySpan<byte> templateIL, Module templateModule)
-        {
-            switch (templateOpCode.OperandType)
-            {
-                case OperandType.InlineNone:
-                    EmitAndTrace(outIL, templateOpCode);
-                    break;
-
-                case OperandType.ShortInlineI when (templateOpCode == OpCodes.Ldc_I4):
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandSByte(ref templateIL));
-                    break;
-
-                case OperandType.ShortInlineI:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandByte(ref templateIL));
-                    break;
-                case OperandType.InlineI:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandInt(ref templateIL));
-                    break;
-                case OperandType.InlineI8:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandLong(ref templateIL));
-                    break;
-
-                case OperandType.ShortInlineR:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandFloat(ref templateIL));
-                    break;
-                case OperandType.InlineR:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandDouble(ref templateIL));
-                    break;
-
-                case OperandType.InlineString:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandString(ref templateIL, templateModule));
-                    break;
-
-                case OperandType.InlineType:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandType(ref templateIL, templateModule));
-                    break;
-                case OperandType.InlineField:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandField(ref templateIL, templateModule));
-                    break;
-                case OperandType.InlineMethod:
-                    EmitAndTrace(outIL, templateOpCode, (MethodInfo)ParseOperandMethod(ref templateIL, templateModule));
-                    break;
-
-                case OperandType.InlineSig:
-                    //EmitAndTrace(outIL, templateOpCode, ParseOperandSignature(ref templateIL, templateModule));
-                    //break;
-                    throw new NotImplementedException();
-
-                case OperandType.ShortInlineVar:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandByte(ref templateIL));
-                    break;
-                case OperandType.InlineVar:
-                    EmitAndTrace(outIL, templateOpCode, ParseOperandUShort(ref templateIL));
-                    break;
-
-                case OperandType.InlineTok:
-                    throw new NotImplementedException();
-
-                case OperandType.InlinePhi:
-                    throw new NotSupportedException();
+                case CilTokenType.Label:
+                    {
+                        if (token is not ICilLabel label)
+                            throw new InvalidOperationException();
+                        ProcessLabel(context, ref index, label);
+                        break;
+                    }
+                case CilTokenType.Instruction:
+                    {
+                        if (token is not ICilInstruction instruction)
+                            throw new InvalidOperationException();
+                        ProcessInstruction(context, ref index, instruction);
+                        break;
+                    }
                 default:
                     throw new InvalidOperationException();
             }
         }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode)
+        private void ProcessLabel(Context context, ref int index, ICilLabel label)
         {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace(opCode.Name);
-            outIL.Emit(opCode);
+            context.Add(label);
         }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode, byte operand)
+        private void ProcessInstruction(Context context, ref int index, ICilInstruction instruction)
         {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace($"{opCode.Name} {operand}");
-            outIL.Emit(opCode, operand);
+            switch (instruction.InstructionType)
+            {
+                case CilInstructionType.LoadArgument when !context.Template.Method.IsStatic && instruction is CilLoadArgumentInstruction ldarg && ldarg.Index == 0:
+                    {
+                        ProcessCapturesAccess(context, ref index, ldarg);
+                        break;
+                    }
+
+                case CilInstructionType.Call when !context.Template.Method.IsStatic && instruction is CilCallInstruction call && call.Method.DeclaringType == typeof(EmitTemplateSurrogate):
+                    {
+                        ProcessSurrogateCall(context, ref index, call);
+                        break;
+                    }
+
+                default:
+                    {
+                        if (instruction.OperandType == CilOperandType.ArgumentIndex)
+                        {
+                            if (instruction is not IHasArgumentIndexOperand argInstruction)
+                                throw new InvalidOperationException();
+
+                            argInstruction.Index += context.ArugmentIndexOffset;
+                        }
+
+                        context.Add(instruction);
+                        break;
+                    }
+            }
         }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode, int operand)
+        private void ProcessCapturesAccess(Context context, ref int index, CilLoadArgumentInstruction ldarg)
         {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace($"{opCode.Name} {operand}");
-            outIL.Emit(opCode, operand);
+            // If here, we're loading outer capture
+            if (context.TemplateBody.Tokens[index + 1] is CilLoadFieldInstruction ldfld)
+            {
+                index++;
+
+                if (ldfld.Field.FieldType == typeof(EmitTemplateSurrogate))
+                {
+                    // Add a new group in prep for a call
+                    context.Push();
+                }
+                else
+                {
+                    // Check if we're in outer or inner capture
+                    if (ldfld.Field.FieldType == context.Callback.Target?.GetType())
+                    {
+                        // Load inner capture from outer capture
+                        if (context.TemplateBody.Tokens[index + 1] is not CilLoadFieldInstruction ldfld_inner)
+                            throw new InvalidOperationException();
+
+                        index++;
+
+                        ldfld = ldfld_inner;
+                    }
+
+                    if (ldfld.Field.DeclaringType != context.Callback.Target?.GetType())
+                        throw new InvalidOperationException();
+
+                    var capture = context.Captures[ldfld.Field];
+
+                    if (capture is MemberInfo member && member.DeclaringType == context.TypeBuilder)
+                    {
+                        context.TargetMemberStack.Push(member);
+                    }
+                    else
+                    {
+                        if (capture is null)
+                        {
+                            context.Add(new CilRawInstruction(OpCodes.Ldnull));
+                        }
+                        else
+                        {
+                            var captureType = capture.GetType();
+                            switch (Type.GetTypeCode(captureType))
+                            {
+                                case TypeCode.Boolean:
+                                    if ((bool)capture)
+                                        context.Add(new CilRawInstruction(OpCodes.Ldc_I4_1));
+                                    else
+                                        context.Add(new CilRawInstruction(OpCodes.Ldc_I4_0));
+                                    break;
+                                case TypeCode.SByte:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4_S, (byte)capture!));
+                                    break;
+                                case TypeCode.Byte:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (byte)capture!));
+                                    break;
+                                case TypeCode.Int16:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (short)capture!));
+                                    break;
+                                case TypeCode.UInt16:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (ushort)capture!));
+                                    break;
+                                case TypeCode.Int32:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (int)capture!));
+                                    break;
+                                case TypeCode.UInt32:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (uint)capture!));
+                                    break;
+                                case TypeCode.Int64:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I8, (long)capture!));
+                                    break;
+                                case TypeCode.UInt64:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I8, (ulong)capture!));
+                                    break;
+                                case TypeCode.Single:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_R4, (float)capture!));
+                                    break;
+                                case TypeCode.Double:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldc_R8, (double)capture!));
+                                    break;
+                                case TypeCode.String:
+                                    context.Add(new CilRawInstruction(OpCodes.Ldstr, (string)capture!));
+                                    break;
+                                default:
+                                    throw new NotSupportedException($"Captured value \"{ldfld.Field.Name}\" has unsupported non-primitive type {captureType}!");
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                throw new InvalidOperationException();
+            }
         }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode, long operand)
+        private void ProcessSurrogateCall(Context context, ref int index, CilCallInstruction call)
         {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace($"{opCode.Name} {operand}L");
-            outIL.Emit(opCode, operand);
+            switch (call.Method.Name)
+            {
+                case nameof(EmitTemplateSurrogate.Get):
+                    {
+                        var member = context.TargetMemberStack.Pop();
+                        var group = context.Pop();
+
+                        switch (member.MemberType)
+                        {
+                            case MemberTypes.Field when member is FieldInfo field:
+                                if (!field.IsStatic)
+                                    context.Add(new CilLoadArgumentInstruction(0));
+                                context.Add(group);
+                                context.Add(new CilLoadFieldInstruction(field));
+                                break;
+                            case MemberTypes.Property when member is PropertyInfo property:
+                                if (!property.GetMethod.IsStatic)
+                                    context.Add(new CilLoadArgumentInstruction(0));
+                                context.Add(group);
+                                context.Add(new CilCallInstruction(property.GetMethod));
+                                break;
+                            default:
+                                throw new Exception();
+                        }
+
+                        break;
+                    }
+
+                case nameof(EmitTemplateSurrogate.Set):
+                    {
+                        var member = context.TargetMemberStack.Pop();
+                        var group = context.Pop();
+
+                        switch (member.MemberType)
+                        {
+                            case MemberTypes.Field when member is FieldInfo field:
+                                if (!field.IsStatic)
+                                    context.Add(new CilLoadArgumentInstruction(0));
+                                context.Add(group);
+                                context.Add(new CilStoreFieldInstruction(field));
+                                break;
+                            case MemberTypes.Property when member is PropertyInfo property:
+                                if (!property.SetMethod.IsStatic)
+                                    context.Add(new CilLoadArgumentInstruction(0));
+                                context.Add(group);
+                                context.Add(new CilCallInstruction(property.SetMethod));
+                                break;
+                            default:
+                                throw new Exception();
+                        }
+
+                        break;
+                    }
+
+                case nameof(EmitTemplateSurrogate.Call):
+                    {
+                        var method = (MethodInfo)context.TargetMemberStack.Pop();
+                        var group = context.Pop();
+
+                        if (!method.IsStatic)
+                            context.Add(new CilLoadArgumentInstruction(0));
+
+                        context.Add(group);
+                        context.Add(new CilCallInstruction(method));
+
+                        break;
+                    }
+            }
         }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode, float operand)
+        private sealed class Context
         {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace($"{opCode.Name} {operand}f");
-            outIL.Emit(opCode, operand);
-        }
+            public TypeBuilder TypeBuilder { get; }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode, double operand)
-        {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace($"{opCode.Name} {operand}d");
-            outIL.Emit(opCode, operand);
-        }
+            public Delegate Callback { get; }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode, string operand)
-        {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace($"{opCode.Name} \"{operand}\"");
-            outIL.Emit(opCode, operand);
-        }
+            public Delegate Template { get; }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode, Type operand)
-        {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace($"{opCode.Name} {operand}");
-            outIL.Emit(opCode, operand);
-        }
+            public ICilMethodBody TemplateBody { get; }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode, FieldInfo operand)
-        {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace($"{opCode.Name} {operand}");
-            outIL.Emit(opCode, operand);
-        }
+            public int ArugmentIndexOffset { get; }
 
-        private void EmitAndTrace(ILGenerator outIL, OpCode opCode, MethodInfo operand)
-        {
-            if (Logger.IsEnabled(LogLevel.Trace))
-                Logger.LogTrace($"{opCode.Name} {operand}");
-            outIL.Emit(opCode, operand);
+            public Dictionary<MemberInfo, object?> Captures { get; } = new();
+
+            public Stack<MemberInfo> TargetMemberStack { get; } = new();
+
+            private Stack<List<ICilToken>> Groups { get; } = new();
+
+            public Context(TypeBuilder typeBuilder, Delegate callback, Delegate template, ICilMethodBody templateBody, int argumentIndexOffset)
+            {
+                TypeBuilder = typeBuilder ?? throw new ArgumentNullException(nameof(typeBuilder));
+                Callback = callback ?? throw new ArgumentNullException(nameof(callback));
+                Template = template ?? throw new ArgumentNullException(nameof(template));
+                TemplateBody = templateBody ?? throw new ArgumentNullException(nameof(templateBody));
+                ArugmentIndexOffset = argumentIndexOffset;
+
+                Push();
+            }
+
+            public void Add(ICilToken token)
+            {
+                Groups.Peek().Add(token);
+            }
+
+            public void Add(IEnumerable<ICilToken> tokens)
+            {
+                Groups.Peek().AddRange(tokens);
+            }
+
+            public void Push()
+            {
+                Groups.Push(new());
+            }
+
+            public List<ICilToken> Pop()
+            {
+                return Groups.Pop();
+            }
         }
     }
 }

@@ -7,13 +7,13 @@ namespace MrHotkeys.Reflection.Emit.Templating.Extensions
 {
     public static class ILGeneratorExtensions
     {
-        public static void EmitCode(this ILGenerator il, Func<EmitTemplateSurrogate, Delegate> callback)
+        public static void EmitCode(this ILGenerator il, TypeBuilder typeBuilder, Func<EmitTemplateSurrogate, Delegate> callback)
         {
-            EmitTemplating.TemplateProcessor.Process(il, false, callback);
+            EmitTemplating.TemplateProcessor.Process(typeBuilder, il, false, callback);
         }
-        public static void EmitCodeStatic(this ILGenerator il, Func<EmitTemplateSurrogate, Delegate> callback)
+        public static void EmitCodeStatic(this ILGenerator il, TypeBuilder typeBuilder, Func<EmitTemplateSurrogate, Delegate> callback)
         {
-            EmitTemplating.TemplateProcessor.Process(il, true, callback);
+            EmitTemplating.TemplateProcessor.Process(typeBuilder, il, true, callback);
         }
 
         /// <summary>
