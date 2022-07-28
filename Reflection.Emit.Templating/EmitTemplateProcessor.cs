@@ -251,6 +251,9 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 case nameof(EmitTemplateSurrogate.Set):
                     ProcessSurrogateSet(context);
                     break;
+                case nameof(EmitTemplateSurrogate.Ref):
+                    ProcessSurrogateRef(context);
+                    break;
                 case nameof(EmitTemplateSurrogate.Call):
                     ProcessSurrogateCall(context);
                     break;
@@ -370,6 +373,43 @@ namespace MrHotkeys.Reflection.Emit.Templating
             };
 
             context.Add(stloc);
+        }
+
+        private void ProcessSurrogateRef(Context context)
+        {
+            var obj = context.SurrogateStack.Pop();
+            switch (obj)
+            {
+                case FieldInfo field:
+                    ProcessSurrogateRefField(context, field);
+                    break;
+                case LocalVariableInfo local:
+                    ProcessSurrogateRefLocal(context, local);
+                    break;
+                default:
+                    throw new InvalidOperationException();
+            }
+        }
+
+        private void ProcessSurrogateRefField(Context context, FieldInfo field)
+        {
+            var group = context.Pop();
+            if (!field.IsStatic)
+                context.Add(new CilLoadArgumentInstruction(0));
+            context.Add(group);
+            context.Add(new CilRawInstruction(OpCodes.Ldflda, field));
+        }
+
+        private void ProcessSurrogateRefLocal(Context context, LocalVariableInfo local)
+        {
+            var group = context.Pop();
+            context.Add(group);
+
+            var ldloca = local.LocalIndex >= byte.MinValue && local.LocalIndex <= byte.MaxValue ?
+                new CilRawInstruction(OpCodes.Ldloca_S, (byte)local.LocalIndex) :
+                new CilRawInstruction(OpCodes.Ldloca, (ushort)local.LocalIndex);
+
+            context.Add(ldloca);
         }
 
         private void ProcessSurrogateCall(Context context)

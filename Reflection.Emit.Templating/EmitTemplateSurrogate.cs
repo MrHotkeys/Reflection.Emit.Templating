@@ -29,6 +29,12 @@ namespace MrHotkeys.Reflection.Emit.Templating
         public void Set<T>(PropertyInfo property, T value) =>
             throw new InvalidOperationException();
 
+        public T Ref<T>(LocalVariableInfo local) =>
+            throw new InvalidOperationException();
+
+        public T Ref<T>(FieldInfo field) =>
+            throw new InvalidOperationException();
+
         public void Call<T>(MethodInfo method, T arg) =>
             throw new InvalidOperationException();
     }
