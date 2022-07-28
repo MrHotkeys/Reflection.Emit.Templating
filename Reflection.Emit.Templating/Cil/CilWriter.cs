@@ -294,7 +294,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
             if (call.Method is not MethodInfo method)
                 throw new InvalidOperationException();
 
-            if (call.Method.IsStatic || call.Method.DeclaringType.IsSealed || (!call.Method.IsAbstract && call.Method.IsVirtual))
+            if (call.Method.IsStatic || call.Method.DeclaringType.IsSealed || (!call.Method.IsAbstract && !call.Method.IsVirtual))
                 EmitAndLog(il, OpCodes.Call, method);
             else
                 EmitAndLog(il, OpCodes.Callvirt, method);
