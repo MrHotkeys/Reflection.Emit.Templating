@@ -1,5 +1,6 @@
 using System;
 using System.Reflection;
+using System.Reflection.Emit;
 
 namespace MrHotkeys.Reflection.Emit.Templating
 {
@@ -10,6 +11,9 @@ namespace MrHotkeys.Reflection.Emit.Templating
         private EmitTemplateSurrogate()
         { }
 
+        public T Get<T>(LocalVariableInfo local) =>
+            throw new InvalidOperationException();
+
         public T Get<T>(FieldInfo field) =>
             throw new InvalidOperationException();
 
@@ -17,6 +21,9 @@ namespace MrHotkeys.Reflection.Emit.Templating
             throw new InvalidOperationException();
 
         public void Set<T>(FieldInfo field, T value) =>
+            throw new InvalidOperationException();
+
+        public void Set<T>(LocalVariableInfo local, T value) =>
             throw new InvalidOperationException();
 
         public void Set<T>(PropertyInfo property, T value) =>

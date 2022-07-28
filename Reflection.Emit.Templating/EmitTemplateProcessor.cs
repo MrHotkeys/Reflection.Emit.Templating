@@ -122,13 +122,11 @@ namespace MrHotkeys.Reflection.Emit.Templating
                         ProcessCapturesAccess(context, ref index, ldarg);
                         break;
                     }
-
                 case CilInstructionType.Call when !context.Template.Method.IsStatic && instruction is CilCallInstruction call && call.Method.DeclaringType == typeof(EmitTemplateSurrogate):
                     {
-                        ProcessSurrogateCall(context, ref index, call);
+                        ProcessSurrogate(context, call);
                         break;
                     }
-
                 default:
                     {
                         if (instruction.OperandType == CilOperandType.ArgumentIndex)
@@ -176,9 +174,9 @@ namespace MrHotkeys.Reflection.Emit.Templating
 
                     var capture = context.Captures[ldfld.Field];
 
-                    if (capture is MemberInfo member && member.DeclaringType == context.TypeBuilder)
+                    if ((capture is MemberInfo member && member.DeclaringType == context.TypeBuilder) || capture is LocalVariableInfo)
                     {
-                        context.TargetMemberStack.Push(member);
+                        context.SurrogateStack.Push(capture);
                     }
                     else
                     {
@@ -243,76 +241,147 @@ namespace MrHotkeys.Reflection.Emit.Templating
             }
         }
 
-        private void ProcessSurrogateCall(Context context, ref int index, CilCallInstruction call)
+        private void ProcessSurrogate(Context context, CilCallInstruction call)
         {
             switch (call.Method.Name)
             {
                 case nameof(EmitTemplateSurrogate.Get):
-                    {
-                        var member = context.TargetMemberStack.Pop();
-                        var group = context.Pop();
-
-                        switch (member.MemberType)
-                        {
-                            case MemberTypes.Field when member is FieldInfo field:
-                                if (!field.IsStatic)
-                                    context.Add(new CilLoadArgumentInstruction(0));
-                                context.Add(group);
-                                context.Add(new CilLoadFieldInstruction(field));
-                                break;
-                            case MemberTypes.Property when member is PropertyInfo property:
-                                if (!property.GetMethod.IsStatic)
-                                    context.Add(new CilLoadArgumentInstruction(0));
-                                context.Add(group);
-                                context.Add(new CilCallInstruction(property.GetMethod));
-                                break;
-                            default:
-                                throw new Exception();
-                        }
-
-                        break;
-                    }
-
+                    ProcessSurrogateGet(context);
+                    break;
                 case nameof(EmitTemplateSurrogate.Set):
-                    {
-                        var member = context.TargetMemberStack.Pop();
-                        var group = context.Pop();
-
-                        switch (member.MemberType)
-                        {
-                            case MemberTypes.Field when member is FieldInfo field:
-                                if (!field.IsStatic)
-                                    context.Add(new CilLoadArgumentInstruction(0));
-                                context.Add(group);
-                                context.Add(new CilStoreFieldInstruction(field));
-                                break;
-                            case MemberTypes.Property when member is PropertyInfo property:
-                                if (!property.SetMethod.IsStatic)
-                                    context.Add(new CilLoadArgumentInstruction(0));
-                                context.Add(group);
-                                context.Add(new CilCallInstruction(property.SetMethod));
-                                break;
-                            default:
-                                throw new Exception();
-                        }
-
-                        break;
-                    }
-
+                    ProcessSurrogateSet(context);
+                    break;
                 case nameof(EmitTemplateSurrogate.Call):
-                    {
-                        var method = (MethodInfo)context.TargetMemberStack.Pop();
-                        var group = context.Pop();
-
-                        if (!method.IsStatic)
-                            context.Add(new CilLoadArgumentInstruction(0));
-
-                        context.Add(group);
-                        context.Add(new CilCallInstruction(method));
-
-                        break;
-                    }
+                    ProcessSurrogateCall(context);
+                    break;
+                default:
+                    throw new InvalidOperationException();
             }
+        }
+
+        private void ProcessSurrogateGet(Context context)
+        {
+            var obj = context.SurrogateStack.Pop();
+            switch (obj)
+            {
+                case MemberInfo member:
+                    ProcessSurrogateGetMember(context, member);
+                    break;
+                case LocalVariableInfo local:
+                    ProcessSurrogateGetLocal(context, local);
+                    break;
+                default:
+                    throw new InvalidOperationException();
+            }
+        }
+
+        private void ProcessSurrogateGetMember(Context context, MemberInfo member)
+        {
+            var group = context.Pop();
+
+            switch (member.MemberType)
+            {
+                case MemberTypes.Field when member is FieldInfo field:
+                    if (!field.IsStatic)
+                        context.Add(new CilLoadArgumentInstruction(0));
+                    context.Add(group);
+                    context.Add(new CilLoadFieldInstruction(field));
+                    break;
+                case MemberTypes.Property when member is PropertyInfo property:
+                    if (!property.GetMethod.IsStatic)
+                        context.Add(new CilLoadArgumentInstruction(0));
+                    context.Add(group);
+                    context.Add(new CilCallInstruction(property.GetMethod));
+                    break;
+                default:
+                    throw new Exception();
+            }
+        }
+
+        private void ProcessSurrogateGetLocal(Context context, LocalVariableInfo local)
+        {
+            var group = context.Pop();
+            context.Add(group);
+
+            var ldloc = local.LocalIndex switch
+            {
+                0 => new CilRawInstruction(OpCodes.Ldloc_0),
+                1 => new CilRawInstruction(OpCodes.Ldloc_1),
+                2 => new CilRawInstruction(OpCodes.Ldloc_2),
+                3 => new CilRawInstruction(OpCodes.Ldloc_3),
+                _ when local.LocalIndex >= byte.MinValue && local.LocalIndex <= byte.MaxValue => new CilRawInstruction(OpCodes.Ldloc_S, local.LocalIndex),
+                _ => new CilRawInstruction(OpCodes.Ldloc, local.LocalIndex),
+            };
+
+            context.Add(ldloc);
+        }
+
+        private void ProcessSurrogateSet(Context context)
+        {
+            var obj = context.SurrogateStack.Pop();
+            switch (obj)
+            {
+                case MemberInfo member:
+                    ProcessSurrogateSetMember(context, member);
+                    break;
+                case LocalVariableInfo local:
+                    ProcessSurrogateSetLocal(context, local);
+                    break;
+                default:
+                    throw new InvalidOperationException();
+            }
+        }
+
+        private void ProcessSurrogateSetMember(Context context, MemberInfo member)
+        {
+            var group = context.Pop();
+            switch (member.MemberType)
+            {
+                case MemberTypes.Field when member is FieldInfo field:
+                    if (!field.IsStatic)
+                        context.Add(new CilLoadArgumentInstruction(0));
+                    context.Add(group);
+                    context.Add(new CilStoreFieldInstruction(field));
+                    break;
+                case MemberTypes.Property when member is PropertyInfo property:
+                    if (!property.SetMethod.IsStatic)
+                        context.Add(new CilLoadArgumentInstruction(0));
+                    context.Add(group);
+                    context.Add(new CilCallInstruction(property.SetMethod));
+                    break;
+                default:
+                    throw new Exception();
+            }
+        }
+
+        private void ProcessSurrogateSetLocal(Context context, LocalVariableInfo local)
+        {
+            var group = context.Pop();
+            context.Add(group);
+
+            var stloc = local.LocalIndex switch
+            {
+                0 => new CilRawInstruction(OpCodes.Stloc_0),
+                1 => new CilRawInstruction(OpCodes.Stloc_1),
+                2 => new CilRawInstruction(OpCodes.Stloc_2),
+                3 => new CilRawInstruction(OpCodes.Stloc_3),
+                _ when local.LocalIndex >= byte.MinValue && local.LocalIndex <= byte.MaxValue => new CilRawInstruction(OpCodes.Stloc_S, local.LocalIndex),
+                _ => new CilRawInstruction(OpCodes.Stloc, local.LocalIndex),
+            };
+
+            context.Add(stloc);
+        }
+
+        private void ProcessSurrogateCall(Context context)
+        {
+            var method = (MethodInfo)context.SurrogateStack.Pop();
+            var group = context.Pop();
+
+            if (!method.IsStatic)
+                context.Add(new CilLoadArgumentInstruction(0));
+
+            context.Add(group);
+            context.Add(new CilCallInstruction(method));
         }
 
         private sealed class Context
@@ -329,7 +398,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
 
             public Dictionary<MemberInfo, object?> Captures { get; } = new();
 
-            public Stack<MemberInfo> TargetMemberStack { get; } = new();
+            public Stack<object?> SurrogateStack { get; } = new();
 
             private Stack<List<ICilToken>> Groups { get; } = new();
 
