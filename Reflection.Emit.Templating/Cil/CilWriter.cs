@@ -389,8 +389,11 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                 case OperandType.InlineField:
                     EmitAndLog(il, opCode, (FieldInfo)raw.Operand!);
                     break;
-                case OperandType.InlineMethod:
-                    EmitAndLog(il, opCode, (MethodInfo)raw.Operand!);
+                case OperandType.InlineMethod when raw.Operand is MethodInfo methodOperand:
+                    EmitAndLog(il, opCode, methodOperand);
+                    break;
+                case OperandType.InlineMethod when raw.Operand is ConstructorInfo constructorOperand:
+                    EmitAndLog(il, opCode, constructorOperand);
                     break;
                 case OperandType.InlineSig:
                     throw new NotImplementedException(); // EmitAndLog(il, opCode, (byte[])instruction.Operand!);
@@ -492,6 +495,13 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
         {
             if (EmitLogLevel.HasValue && Logger.IsEnabled(EmitLogLevel.Value))
                 Logger.Log(EmitLogLevel.Value, $"{opCode.Name} {operand.ReturnType.Name ?? "void"} {operand.DeclaringType}.{operand.Name}");
+            il.Emit(opCode, operand);
+        }
+
+        private void EmitAndLog(ILGenerator il, OpCode opCode, ConstructorInfo operand)
+        {
+            if (EmitLogLevel.HasValue && Logger.IsEnabled(EmitLogLevel.Value))
+                Logger.Log(EmitLogLevel.Value, $"{opCode.Name} {operand.DeclaringType}");
             il.Emit(opCode, operand);
         }
 
