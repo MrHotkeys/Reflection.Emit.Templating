@@ -1,5 +1,6 @@
 using System;
 using System.Reflection;
+using System.Reflection.Emit;
 
 namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
 {
@@ -20,6 +21,10 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
             get => _field;
             set => _field = (FieldInfo)(value ?? throw new ArgumentNullException(nameof(ICilInstruction.Operand)));
         }
+
+        public StackBehaviour StackBehaviourPop => StackBehaviour.Pop1;
+
+        public StackBehaviour StackBehaviourPush => StackBehaviour.Push1;
 
         public CilLoadFieldInstruction(FieldInfo field)
         {

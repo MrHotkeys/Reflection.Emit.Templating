@@ -1,4 +1,5 @@
 using System;
+using System.Reflection.Emit;
 
 namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
 {
@@ -21,6 +22,15 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
         }
 
         public CilBranchCondition Condition { get; set; }
+
+        public StackBehaviour StackBehaviourPop => Condition switch
+        {
+            CilBranchCondition.Always => StackBehaviour.Pop0,
+            CilBranchCondition.True or CilBranchCondition.False => StackBehaviour.Pop1,
+            _ => StackBehaviour.Pop1_pop1,
+        };
+
+        public StackBehaviour StackBehaviourPush => StackBehaviour.Push0;
 
         public CilBranchInstruction(ICilLabel label)
         {

@@ -12,6 +12,10 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
 
         public object? Operand { get; set; }
 
+        public StackBehaviour StackBehaviourPop => OpCode.StackBehaviourPop;
+
+        public StackBehaviour StackBehaviourPush => OpCode.StackBehaviourPush;
+
         public CilRawInstruction(OpCode opCode)
         {
             OpCode = opCode;

@@ -1,4 +1,5 @@
 using System;
+using System.Reflection.Emit;
 
 namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
 {
@@ -19,6 +20,10 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
             get => _local;
             set => _local = (ICilLocalVariable)(value ?? throw new ArgumentNullException(nameof(ICilInstruction.Operand)));
         }
+
+        public StackBehaviour StackBehaviourPop => StackBehaviour.Pop1;
+
+        public StackBehaviour StackBehaviourPush => StackBehaviour.Push0;
 
         public CilStoreLocalInstruction(ICilLocalVariable local)
         {

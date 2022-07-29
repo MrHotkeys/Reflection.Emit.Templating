@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 
@@ -28,11 +29,12 @@ namespace MrHotkeys.Reflection.Emit.Templating
         public void Process(TypeBuilder typeBuilder, ILGenerator il, bool outIsStatic, Func<EmitTemplateSurrogate, Delegate> callback)
         {
             var template = callback(EmitTemplateSurrogate.Instance);
+            var templateBody = CilParser.ParseMethodBody(template.Method);
+            var tokens = new Queue<ICilToken>(templateBody.Tokens);
             var context = new Context(
                 typeBuilder: typeBuilder,
                 callback: callback,
                 template: template,
-                templateBody: CilParser.ParseMethodBody(template.Method),
                 argumentIndexOffset: GetArgIndexOffset(template.Method.IsStatic, outIsStatic));
 
             if (callback.Target is not null)
@@ -40,18 +42,14 @@ namespace MrHotkeys.Reflection.Emit.Templating
             if (template.Target is not null)
                 AddCaptures(template.Target, context.Captures);
 
-            for (var i = 0; i < context.TemplateBody.Tokens.Count; i++)
-            {
-                var token = context.TemplateBody.Tokens[i];
-                ProcessToken(context, ref i, token);
-            }
+            ProcessTokens(context, tokens);
 
-            context.TemplateBody.Tokens = context.Pop();
+            templateBody.Tokens = context.Result;
 
-            if (context.TemplateBody.Tokens[^1] is ICilInstruction lastInstruction && lastInstruction.InstructionType == CilInstructionType.Return)
-                context.TemplateBody.Tokens.RemoveAt(context.TemplateBody.Tokens.Count - 1);
+            if (templateBody.Tokens[^1] is ICilInstruction lastInstruction && lastInstruction.InstructionType == CilInstructionType.Return)
+                templateBody.Tokens.RemoveAt(templateBody.Tokens.Count - 1);
 
-            CilWriter.Write(il, context.TemplateBody);
+            CilWriter.Write(il, templateBody);
         }
 
         private void AddCaptures(object target, Dictionary<MemberInfo, object?> captures)
@@ -85,7 +83,16 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 return -1;
         }
 
-        private void ProcessToken(Context context, ref int index, ICilToken token)
+        private void ProcessTokens(Context context, Queue<ICilToken> tokens)
+        {
+            while (tokens.Count > 0)
+            {
+                var token = tokens.Dequeue();
+                ProcessToken(context, tokens, token);
+            }
+        }
+
+        private void ProcessToken(Context context, Queue<ICilToken> tokens, ICilToken token)
         {
             switch (token.TokenType)
             {
@@ -93,14 +100,14 @@ namespace MrHotkeys.Reflection.Emit.Templating
                     {
                         if (token is not ICilLabel label)
                             throw new InvalidOperationException();
-                        ProcessLabel(context, ref index, label);
+                        ProcessLabel(context, label);
                         break;
                     }
                 case CilTokenType.Instruction:
                     {
                         if (token is not ICilInstruction instruction)
                             throw new InvalidOperationException();
-                        ProcessInstruction(context, ref index, instruction);
+                        ProcessInstruction(context, tokens, instruction);
                         break;
                     }
                 default:
@@ -108,23 +115,29 @@ namespace MrHotkeys.Reflection.Emit.Templating
             }
         }
 
-        private void ProcessLabel(Context context, ref int index, ICilLabel label)
+        private void ProcessLabel(Context context, ICilLabel label)
         {
-            context.Add(label);
+            context.Result.Add(label);
         }
 
-        private void ProcessInstruction(Context context, ref int index, ICilInstruction instruction)
+        private void ProcessInstructions(Context context, Queue<ICilInstruction> instructions)
+        {
+            var tokens = new Queue<ICilToken>(instructions);
+            while (tokens.Count > 0)
+            {
+                var instruction = (ICilInstruction)tokens.Dequeue();
+                ProcessInstruction(context, tokens, instruction);
+            }
+            instructions.Clear();
+        }
+
+        private void ProcessInstruction(Context context, Queue<ICilToken> tokens, ICilInstruction instruction)
         {
             switch (instruction.InstructionType)
             {
                 case CilInstructionType.LoadArgument when !context.Template.Method.IsStatic && instruction is CilLoadArgumentInstruction ldarg && ldarg.Index == 0:
                     {
-                        ProcessCapturesAccess(context, ref index, ldarg);
-                        break;
-                    }
-                case CilInstructionType.Call when !context.Template.Method.IsStatic && instruction is CilCallInstruction call && call.Method.DeclaringType == typeof(EmitTemplateSurrogate):
-                    {
-                        ProcessSurrogate(context, call);
+                        ProcessCapturesAccess(context, tokens, ldarg);
                         break;
                     }
                 default:
@@ -137,175 +150,129 @@ namespace MrHotkeys.Reflection.Emit.Templating
                             argInstruction.Index += context.ArugmentIndexOffset;
                         }
 
-                        context.Add(instruction);
+                        context.Result.Add(instruction);
                         break;
                     }
             }
         }
 
-        private void ProcessCapturesAccess(Context context, ref int index, CilLoadArgumentInstruction ldarg)
+        private void ProcessCapturesAccess(Context context, Queue<ICilToken> tokens, CilLoadArgumentInstruction ldarg)
         {
-            // If here, we're loading outer capture
-            if (context.TemplateBody.Tokens[index + 1] is CilLoadFieldInstruction ldfld)
+            if (tokens.Dequeue() is not CilLoadFieldInstruction ldfld)
+                throw new InvalidOperationException();
+
+            if (ldfld.Field.FieldType == typeof(EmitTemplateSurrogate))
             {
-                index++;
+                var surrogateInstructions = LookAheadToSurrogateMethodCall(tokens);
+                var call = (CilCallInstruction)surrogateInstructions.Pop();
+                var argInstructions = GroupArgInstructions(call.Method, surrogateInstructions);
 
-                if (ldfld.Field.FieldType == typeof(EmitTemplateSurrogate))
-                {
-                    // Add a new group in prep for a call
-                    context.Push();
-                }
-                else
-                {
-                    // Check if we're in outer or inner capture
-                    if (ldfld.Field.FieldType == context.Callback.Target?.GetType())
-                    {
-                        // Load inner capture from outer capture
-                        if (context.TemplateBody.Tokens[index + 1] is not CilLoadFieldInstruction ldfld_inner)
-                            throw new InvalidOperationException();
+                // Make sure all instructions we sent in got consumed, shouldn't have any extras since we already found the target for the call (ldfld)
+                if (surrogateInstructions.Count > 0)
+                    throw new InvalidOperationException();
 
-                        index++;
-
-                        ldfld = ldfld_inner;
-                    }
-
-                    if (ldfld.Field.DeclaringType != context.Callback.Target?.GetType())
-                        throw new InvalidOperationException();
-
-                    var capture = context.Captures[ldfld.Field];
-
-                    if ((capture is MemberInfo member && member.DeclaringType == context.TypeBuilder) || capture is LocalVariableInfo)
-                    {
-                        context.SurrogateStack.Push(capture);
-                    }
-                    else
-                    {
-                        if (capture is null)
-                        {
-                            context.Add(new CilRawInstruction(OpCodes.Ldnull));
-                        }
-                        else
-                        {
-                            var captureType = capture.GetType();
-                            switch (Type.GetTypeCode(captureType))
-                            {
-                                case TypeCode.Boolean:
-                                    if ((bool)capture)
-                                        context.Add(new CilRawInstruction(OpCodes.Ldc_I4_1));
-                                    else
-                                        context.Add(new CilRawInstruction(OpCodes.Ldc_I4_0));
-                                    break;
-                                case TypeCode.SByte:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4_S, (byte)capture!));
-                                    break;
-                                case TypeCode.Byte:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (byte)capture!));
-                                    break;
-                                case TypeCode.Int16:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (short)capture!));
-                                    break;
-                                case TypeCode.UInt16:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (ushort)capture!));
-                                    break;
-                                case TypeCode.Int32:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (int)capture!));
-                                    break;
-                                case TypeCode.UInt32:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I4, (uint)capture!));
-                                    break;
-                                case TypeCode.Int64:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I8, (long)capture!));
-                                    break;
-                                case TypeCode.UInt64:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_I8, (ulong)capture!));
-                                    break;
-                                case TypeCode.Single:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_R4, (float)capture!));
-                                    break;
-                                case TypeCode.Double:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldc_R8, (double)capture!));
-                                    break;
-                                case TypeCode.String:
-                                    context.Add(new CilRawInstruction(OpCodes.Ldstr, (string)capture!));
-                                    break;
-                                default:
-                                    throw new NotSupportedException($"Captured value \"{ldfld.Field.Name}\" has unsupported non-primitive type {captureType}!");
-                            }
-                        }
-                    }
-                }
+                ProcessSurrogateMethod(context, (MethodInfo)call.Method, argInstructions);
             }
             else
             {
-                throw new InvalidOperationException();
+                // Check if we're in outer or inner capture
+                if (ldfld.Field.FieldType == context.Callback.Target?.GetType())
+                {
+                    // Load inner capture from outer capture
+                    if (tokens.Dequeue() is not CilLoadFieldInstruction ldfld_inner)
+                        throw new InvalidOperationException();
+
+                    ldfld = ldfld_inner;
+                }
+
+                if (ldfld.Field.DeclaringType != context.Callback.Target?.GetType())
+                    throw new InvalidOperationException();
+
+                var capture = context.Captures[ldfld.Field];
+                ICilInstruction instruction = capture switch
+                {
+                    null => new CilRawInstruction(OpCodes.Ldnull),
+                    bool b => new CilRawInstruction(b ? OpCodes.Ldc_I4_1 : OpCodes.Ldc_I4_0),
+                    sbyte sb => new CilRawInstruction(OpCodes.Ldc_I4_S, sb),
+                    byte b => new CilRawInstruction(OpCodes.Ldc_I4, b),
+                    short s => new CilRawInstruction(OpCodes.Ldc_I4, s),
+                    ushort us => new CilRawInstruction(OpCodes.Ldc_I4, us),
+                    int i => new CilRawInstruction(OpCodes.Ldc_I4, i),
+                    uint ui => new CilRawInstruction(OpCodes.Ldc_I4, ui),
+                    long l => new CilRawInstruction(OpCodes.Ldc_I8, l),
+                    ulong ul => new CilRawInstruction(OpCodes.Ldc_I8, ul),
+                    float f => new CilRawInstruction(OpCodes.Ldc_R4, f),
+                    double d => new CilRawInstruction(OpCodes.Ldc_R8, d),
+                    string s => new CilRawInstruction(OpCodes.Ldstr, s),
+                    _ => throw new NotSupportedException($"Captured value \"{ldfld.Field.Name}\" has unsupported non-primitive type {capture.GetType()}!"),
+                };
+                context.Result.Add(instruction);
             }
         }
 
-        private void ProcessSurrogate(Context context, CilCallInstruction call)
+        private void ProcessSurrogateMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
         {
-            switch (call.Method.Name)
+            switch (surrogateMethod.Name)
             {
                 case nameof(EmitTemplateSurrogate.Get):
-                    ProcessSurrogateGet(context);
+                    ProcessSurrogateGetMethod(context, surrogateMethod, argsInstructions);
                     break;
                 case nameof(EmitTemplateSurrogate.Set):
-                    ProcessSurrogateSet(context);
+                    ProcessSurrogateSetMethod(context, surrogateMethod, argsInstructions);
                     break;
                 case nameof(EmitTemplateSurrogate.Ref):
-                    ProcessSurrogateRef(context);
+                    ProcessSurrogateRefMethod(context, surrogateMethod, argsInstructions);
                     break;
                 case nameof(EmitTemplateSurrogate.Call):
-                    ProcessSurrogateCall(context);
+                    ProcessSurrogateCallMethod(context, surrogateMethod, argsInstructions);
                     break;
                 default:
                     throw new InvalidOperationException();
             }
         }
 
-        private void ProcessSurrogateGet(Context context)
+        private void ProcessSurrogateGetMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
         {
-            var obj = context.SurrogateStack.Pop();
-            switch (obj)
-            {
-                case MemberInfo member:
-                    ProcessSurrogateGetMember(context, member);
-                    break;
-                case LocalVariableInfo local:
-                    ProcessSurrogateGetLocal(context, local);
-                    break;
-                default:
-                    throw new InvalidOperationException();
-            }
+            var parameters = surrogateMethod.GetParameters();
+            if (parameters.Length != 1)
+                throw new InvalidOperationException();
+
+            if (argsInstructions.Count != parameters.Length)
+                throw new InvalidOperationException();
+
+            var capture = GetCaptureArg(context, argsInstructions.Dequeue());
+            if (capture is null)
+                throw new InvalidOperationException();
+
+            var variableType = parameters[0].ParameterType;
+            if (variableType == typeof(FieldInfo))
+                ProcessSurrogateGetFieldMethod(context, (FieldInfo)capture);
+            else if (variableType == typeof(PropertyInfo))
+                ProcessSurrogateGetProperty(context, (PropertyInfo)capture);
+            else if (variableType == typeof(LocalVariableInfo))
+                ProcessSurrogateGetLocalMethod(context, (LocalVariableInfo)capture);
+            else
+                throw new InvalidOperationException();
         }
 
-        private void ProcessSurrogateGetMember(Context context, MemberInfo member)
+        private void ProcessSurrogateGetFieldMethod(Context context, FieldInfo field)
         {
-            var group = context.Pop();
+            if (!field.IsStatic)
+                context.Result.Add(new CilLoadArgumentInstruction(0));
 
-            switch (member.MemberType)
-            {
-                case MemberTypes.Field when member is FieldInfo field:
-                    if (!field.IsStatic)
-                        context.Add(new CilLoadArgumentInstruction(0));
-                    context.Add(group);
-                    context.Add(new CilLoadFieldInstruction(field));
-                    break;
-                case MemberTypes.Property when member is PropertyInfo property:
-                    if (!property.GetMethod.IsStatic)
-                        context.Add(new CilLoadArgumentInstruction(0));
-                    context.Add(group);
-                    context.Add(new CilCallInstruction(property.GetMethod));
-                    break;
-                default:
-                    throw new Exception();
-            }
+            context.Result.Add(new CilLoadFieldInstruction(field));
         }
 
-        private void ProcessSurrogateGetLocal(Context context, LocalVariableInfo local)
+        private void ProcessSurrogateGetProperty(Context context, PropertyInfo property)
         {
-            var group = context.Pop();
-            context.Add(group);
+            if (!property.GetMethod.IsStatic)
+                context.Result.Add(new CilLoadArgumentInstruction(0));
 
+            context.Result.Add(new CilCallInstruction(property.GetMethod));
+        }
+
+        private void ProcessSurrogateGetLocalMethod(Context context, LocalVariableInfo local)
+        {
             var ldloc = local.LocalIndex switch
             {
                 0 => new CilRawInstruction(OpCodes.Ldloc_0),
@@ -316,51 +283,57 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 _ => new CilRawInstruction(OpCodes.Ldloc, local.LocalIndex),
             };
 
-            context.Add(ldloc);
+            context.Result.Add(ldloc);
         }
 
-        private void ProcessSurrogateSet(Context context)
+        private void ProcessSurrogateSetMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
         {
-            var obj = context.SurrogateStack.Pop();
-            switch (obj)
-            {
-                case MemberInfo member:
-                    ProcessSurrogateSetMember(context, member);
-                    break;
-                case LocalVariableInfo local:
-                    ProcessSurrogateSetLocal(context, local);
-                    break;
-                default:
-                    throw new InvalidOperationException();
-            }
+            var parameters = surrogateMethod.GetParameters();
+            if (parameters.Length != 2)
+                throw new InvalidOperationException();
+
+            if (argsInstructions.Count != parameters.Length)
+                throw new InvalidOperationException();
+
+            var capture = GetCaptureArg(context, argsInstructions.Dequeue());
+            if (capture is null)
+                throw new InvalidOperationException();
+
+            var valueInstructions = argsInstructions.Dequeue();
+            var variableType = parameters[0].ParameterType;
+            if (variableType == typeof(FieldInfo))
+                ProcessSurrogateSetFieldMethod(context, (FieldInfo)capture, valueInstructions);
+            else if (variableType == typeof(PropertyInfo))
+                ProcessSurrogateSetPropertyMethod(context, (PropertyInfo)capture, valueInstructions);
+            else if (variableType == typeof(LocalVariableInfo))
+                ProcessSurrogateSetLocalMethod(context, (LocalVariableInfo)capture, valueInstructions);
+            else
+                throw new InvalidOperationException();
         }
 
-        private void ProcessSurrogateSetMember(Context context, MemberInfo member)
+        private void ProcessSurrogateSetFieldMethod(Context context, FieldInfo field, Queue<ICilInstruction> valueInstructions)
         {
-            var group = context.Pop();
-            switch (member.MemberType)
-            {
-                case MemberTypes.Field when member is FieldInfo field:
-                    if (!field.IsStatic)
-                        context.Add(new CilLoadArgumentInstruction(0));
-                    context.Add(group);
-                    context.Add(new CilStoreFieldInstruction(field));
-                    break;
-                case MemberTypes.Property when member is PropertyInfo property:
-                    if (!property.SetMethod.IsStatic)
-                        context.Add(new CilLoadArgumentInstruction(0));
-                    context.Add(group);
-                    context.Add(new CilCallInstruction(property.SetMethod));
-                    break;
-                default:
-                    throw new Exception();
-            }
+            if (!field.IsStatic)
+                context.Result.Add(new CilLoadArgumentInstruction(0));
+
+            ProcessInstructions(context, valueInstructions);
+
+            context.Result.Add(new CilStoreFieldInstruction(field));
         }
 
-        private void ProcessSurrogateSetLocal(Context context, LocalVariableInfo local)
+        private void ProcessSurrogateSetPropertyMethod(Context context, PropertyInfo property, Queue<ICilInstruction> valueInstructions)
         {
-            var group = context.Pop();
-            context.Add(group);
+            if (!property.SetMethod.IsStatic)
+                context.Result.Add(new CilLoadArgumentInstruction(0));
+
+            ProcessInstructions(context, valueInstructions);
+
+            context.Result.Add(new CilCallInstruction(property.SetMethod));
+        }
+
+        private void ProcessSurrogateSetLocalMethod(Context context, LocalVariableInfo local, Queue<ICilInstruction> valueInstructions)
+        {
+            ProcessInstructions(context, valueInstructions);
 
             var stloc = local.LocalIndex switch
             {
@@ -372,56 +345,308 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 _ => new CilRawInstruction(OpCodes.Stloc, local.LocalIndex),
             };
 
-            context.Add(stloc);
+            context.Result.Add(stloc);
         }
 
-        private void ProcessSurrogateRef(Context context)
+        private void ProcessSurrogateRefMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
         {
-            var obj = context.SurrogateStack.Pop();
-            switch (obj)
-            {
-                case FieldInfo field:
-                    ProcessSurrogateRefField(context, field);
-                    break;
-                case LocalVariableInfo local:
-                    ProcessSurrogateRefLocal(context, local);
-                    break;
-                default:
-                    throw new InvalidOperationException();
-            }
+            var parameters = surrogateMethod.GetParameters();
+            if (parameters.Length != 1)
+                throw new InvalidOperationException();
+
+            if (argsInstructions.Count != parameters.Length)
+                throw new InvalidOperationException();
+
+            var capture = GetCaptureArg(context, argsInstructions.Dequeue());
+            if (capture is null)
+                throw new InvalidOperationException();
+
+            var variableType = parameters[0].ParameterType;
+            if (variableType == typeof(FieldInfo))
+                ProcessSurrogateRefFieldMethod(context, (FieldInfo)capture);
+            else if (variableType == typeof(LocalVariableInfo))
+                ProcessSurrogateRefLocalMethod(context, (LocalVariableInfo)capture);
+            else
+                throw new InvalidOperationException();
         }
 
-        private void ProcessSurrogateRefField(Context context, FieldInfo field)
+        private void ProcessSurrogateRefFieldMethod(Context context, FieldInfo field)
         {
-            var group = context.Pop();
             if (!field.IsStatic)
-                context.Add(new CilLoadArgumentInstruction(0));
-            context.Add(group);
-            context.Add(new CilRawInstruction(OpCodes.Ldflda, field));
+                context.Result.Add(new CilLoadArgumentInstruction(0));
+
+            context.Result.Add(new CilRawInstruction(OpCodes.Ldflda, field));
         }
 
-        private void ProcessSurrogateRefLocal(Context context, LocalVariableInfo local)
+        private void ProcessSurrogateRefLocalMethod(Context context, LocalVariableInfo local)
         {
-            var group = context.Pop();
-            context.Add(group);
-
             var ldloca = local.LocalIndex >= byte.MinValue && local.LocalIndex <= byte.MaxValue ?
                 new CilRawInstruction(OpCodes.Ldloca_S, (byte)local.LocalIndex) :
                 new CilRawInstruction(OpCodes.Ldloca, (ushort)local.LocalIndex);
 
-            context.Add(ldloca);
+            context.Result.Add(ldloca);
         }
 
-        private void ProcessSurrogateCall(Context context)
+        private void ProcessSurrogateCallMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
         {
-            var method = (MethodInfo)context.SurrogateStack.Pop();
-            var group = context.Pop();
+            var parameters = surrogateMethod.GetParameters();
+            if (parameters.Length < 1)
+                throw new InvalidOperationException();
 
-            if (!method.IsStatic)
-                context.Add(new CilLoadArgumentInstruction(0));
+            if (argsInstructions.Count != parameters.Length)
+                throw new InvalidOperationException();
 
-            context.Add(group);
-            context.Add(new CilCallInstruction(method));
+            var methodSourceType = parameters[0].ParameterType;
+            if (methodSourceType == typeof(MethodInfo))
+            {
+                var method = (MethodInfo)GetCaptureArg(context, argsInstructions.Dequeue())!;
+
+                if (!method.IsStatic)
+                    context.Result.Add(new CilLoadArgumentInstruction(0));
+
+                ProcessArgsInstructions(context, argsInstructions);
+
+                context.Result.Add(new CilCallInstruction(method));
+            }
+            else if (methodSourceType == typeof(Delegate) || methodSourceType.BaseType == typeof(MulticastDelegate))
+            {
+                var methodInstructions = new Stack<ICilInstruction>(argsInstructions.Dequeue());
+
+                if (methodInstructions.Pop() is not CilRawInstruction delegateNew || delegateNew.OpCode != OpCodes.Newobj)
+                    throw new InvalidOperationException();
+                if (delegateNew.Operand is not ConstructorInfo delegateCtor || !typeof(Delegate).IsAssignableFrom(delegateCtor.DeclaringType))
+                    throw new InvalidOperationException();
+
+                var ctorInstructions = GroupArgInstructions(delegateCtor, methodInstructions);
+
+                var targetInstructions = ctorInstructions.Dequeue();
+                if (targetInstructions.Peek() is not CilRawInstruction ldnull || ldnull.OpCode != OpCodes.Ldnull)
+                    ProcessInstructions(context, targetInstructions);
+
+                var methodPointerInstructions = ctorInstructions.Dequeue();
+                if (methodPointerInstructions.Dequeue() is not CilRawInstruction ldftn || ldftn.OpCode != OpCodes.Ldftn)
+                    throw new InvalidOperationException();
+                if (ldftn.Operand is not MethodBase method)
+                    throw new InvalidOperationException();
+
+                if (ctorInstructions.Count > 0)
+                    throw new InvalidOperationException();
+
+                ProcessArgsInstructions(context, argsInstructions);
+
+                context.Result.Add(new CilCallInstruction(method));
+            }
+            else
+            {
+                throw new InvalidOperationException();
+            }
+        }
+
+        private Stack<ICilInstruction> LookAheadToSurrogateMethodCall(Queue<ICilToken> tokens)
+        {
+            var stack = new Stack<ICilInstruction>();
+            var depth = 0;
+            while (tokens.Count > 0)
+            {
+                if (tokens.Dequeue() is not ICilInstruction instruction)
+                    throw new InvalidOperationException();
+
+                stack.Push(instruction);
+
+                switch (instruction.InstructionType)
+                {
+                    case CilInstructionType.LoadField when instruction is CilLoadFieldInstruction ldfld && ldfld.Field.FieldType == typeof(EmitTemplateSurrogate):
+                        {
+                            depth++;
+
+                            break;
+                        }
+                    case CilInstructionType.Call when instruction is CilCallInstruction call && call.Method.DeclaringType == typeof(EmitTemplateSurrogate):
+                        {
+                            if (depth == 0)
+                                return stack;
+
+                            depth--;
+
+                            break;
+                        }
+                    default:
+                        {
+                            // TODO: Follow each branch and we're okay if we make it back to this branch instruction or the same next call or ldfld at same depth?
+                            if (IsJump(instruction))
+                                throw new InvalidOperationException();
+
+                            break;
+                        }
+                }
+            }
+
+            // If we haven't returned yet then we haven't found a paired call instruction
+            throw new InvalidOperationException();
+        }
+
+        private Queue<Queue<ICilInstruction>> GroupArgInstructions(MethodBase method, Stack<ICilInstruction> argInstructions)
+        {
+            var parameters = method.GetParameters();
+
+            var parameterInstructions = new List<List<ICilInstruction>>(parameters.Length);
+            for (var i = 0; i < parameters.Length; i++)
+                parameterInstructions.Add(new List<ICilInstruction>());
+
+            var parameterIndex = parameters.Length - 1;
+            var stack = -1;
+            while (argInstructions.Count > 0)
+            {
+                if (argInstructions.Pop() is not ICilInstruction instruction)
+                    throw new InvalidOperationException();
+
+                parameterInstructions[parameterIndex].Add(instruction);
+
+                // TODO: Hack to ignore stloc->ldloc or stloc->ldloca chains confusing the depth search
+                // Ignore a ldloc or ldloca if that local was written to in the instruction immediately previous
+                if (argInstructions.Count != 0 && instruction.InstructionType == CilInstructionType.LoadLocal || instruction.InstructionType == CilInstructionType.LoadLocalAddress)
+                {
+                    if (instruction is not IHasLocalOperand hasLocal)
+                        throw new InvalidOperationException();
+
+                    if (argInstructions.Peek() is ICilInstruction peek && peek.InstructionType == CilInstructionType.StoreLocal)
+                    {
+                        if (peek is not CilStoreLocalInstruction stloc)
+                            throw new InvalidOperationException();
+
+                        if (hasLocal.Local == stloc.Local)
+                        {
+                            parameterInstructions[parameterIndex].Add(argInstructions.Pop());
+                            continue;
+                        }
+                    }
+                }
+
+                if (IsJump(instruction))
+                    throw new InvalidOperationException();
+
+                var pop = GetPopOffset(instruction);
+                var push = GetPushOffset(instruction);
+
+                stack = stack - pop + push;
+
+                if (stack == 0)
+                {
+                    parameterIndex--;
+                    stack = -1;
+
+                    if (parameterIndex < 0)
+                        break;
+                }
+            }
+
+            if (parameterIndex >= 0)
+                throw new InvalidOperationException();
+
+            var result = parameterInstructions
+                .Select(i => i
+                    .AsEnumerable()
+                    .Reverse())
+                .Select(i => new Queue<ICilInstruction>(i));
+
+            return new Queue<Queue<ICilInstruction>>(result);
+        }
+
+        private int GetPopOffset(ICilInstruction instruction)
+        {
+            return instruction.StackBehaviourPop switch
+            {
+                StackBehaviour.Pop0 => 0,
+                StackBehaviour.Pop1 => 1,
+                StackBehaviour.Pop1_pop1 => 2,
+                StackBehaviour.Popi => 1,
+                StackBehaviour.Popi_pop1 => 2,
+                StackBehaviour.Popi_popi => 2,
+                StackBehaviour.Popi_popi8 => 2,
+                StackBehaviour.Popi_popi_popi => 3,
+                StackBehaviour.Popi_popr4 => 2,
+                StackBehaviour.Popi_popr8 => 3,
+                StackBehaviour.Popref => 1,
+                StackBehaviour.Popref_pop1 => 2,
+                StackBehaviour.Popref_popi_pop1 => 3,
+                StackBehaviour.Popref_popi_popi => 3,
+                StackBehaviour.Popref_popi_popi8 => 3,
+                StackBehaviour.Popref_popi_popr4 => 3,
+                StackBehaviour.Popref_popi_popr8 => 3,
+                StackBehaviour.Popref_popi_popref => 3,
+                StackBehaviour.Varpop when instruction is CilCallInstruction call => call.Method.GetParameters().Length + (call.Method.IsStatic ? 0 : 1),
+                StackBehaviour.Varpop when instruction is CilRawInstruction raw && raw.OpCode == OpCodes.Newobj => ((MethodBase)raw.Operand!).GetParameters().Length,
+                _ => throw new InvalidOperationException(),
+            };
+        }
+
+        private int GetPushOffset(ICilInstruction instruction)
+        {
+            return instruction.StackBehaviourPush switch
+            {
+                StackBehaviour.Push0 => 0,
+                StackBehaviour.Push1 => 1,
+                StackBehaviour.Push1_push1 => 2,
+                StackBehaviour.Pushi => 1,
+                StackBehaviour.Pushi8 => 1,
+                StackBehaviour.Pushr4 => 1,
+                StackBehaviour.Pushr8 => 1,
+                StackBehaviour.Pushref => 1,
+                StackBehaviour.Varpush when instruction is CilCallInstruction call && call.Method is MethodInfo method => method.ReturnType is null ? 0 : 1,
+                _ => throw new InvalidOperationException(),
+            };
+        }
+
+        private bool IsJump(ICilInstruction instruction)
+        {
+            if (instruction.InstructionType == CilInstructionType.Branch)
+                return true;
+
+            if (instruction.InstructionType == CilInstructionType.Raw)
+            {
+                if (instruction is not CilRawInstruction raw)
+                    throw new InvalidOperationException();
+
+                return raw.OpCode.FlowControl switch
+                {
+                    FlowControl.Next or
+                    FlowControl.Call => false,
+                    _ => true,
+                };
+            }
+
+            return false;
+        }
+
+        private object? GetCaptureArg(Context context, Queue<ICilInstruction> argInstructions)
+        {
+            if (argInstructions.Dequeue() is not CilLoadArgumentInstruction ldarg || ldarg.Index != 0)
+                throw new InvalidOperationException();
+            if (argInstructions.Dequeue() is not CilLoadFieldInstruction ldfld)
+                throw new InvalidOperationException();
+
+            // Check if we're in outer or inner capture
+            if (ldfld.Field.FieldType == context.Callback.Target?.GetType())
+            {
+                if (argInstructions.Dequeue() is not CilLoadFieldInstruction ldfld_inner)
+                    throw new InvalidOperationException();
+
+                ldfld = ldfld_inner;
+            }
+
+            if (ldfld.Field.DeclaringType != context.Callback.Target?.GetType())
+                throw new InvalidOperationException();
+
+            if (argInstructions.Count > 0)
+                throw new InvalidOperationException();
+
+            return context.Captures[ldfld.Field];
+        }
+
+        private void ProcessArgsInstructions(Context context, Queue<Queue<ICilInstruction>> argsInstructions)
+        {
+            foreach (var queue in argsInstructions)
+                ProcessInstructions(context, queue);
         }
 
         private sealed class Context
@@ -431,46 +656,18 @@ namespace MrHotkeys.Reflection.Emit.Templating
             public Delegate Callback { get; }
 
             public Delegate Template { get; }
-
-            public ICilMethodBody TemplateBody { get; }
-
             public int ArugmentIndexOffset { get; }
 
             public Dictionary<MemberInfo, object?> Captures { get; } = new();
 
-            public Stack<object?> SurrogateStack { get; } = new();
+            public List<ICilToken> Result { get; } = new();
 
-            private Stack<List<ICilToken>> Groups { get; } = new();
-
-            public Context(TypeBuilder typeBuilder, Delegate callback, Delegate template, ICilMethodBody templateBody, int argumentIndexOffset)
+            public Context(TypeBuilder typeBuilder, Delegate callback, Delegate template, int argumentIndexOffset)
             {
                 TypeBuilder = typeBuilder ?? throw new ArgumentNullException(nameof(typeBuilder));
                 Callback = callback ?? throw new ArgumentNullException(nameof(callback));
                 Template = template ?? throw new ArgumentNullException(nameof(template));
-                TemplateBody = templateBody ?? throw new ArgumentNullException(nameof(templateBody));
                 ArugmentIndexOffset = argumentIndexOffset;
-
-                Push();
-            }
-
-            public void Add(ICilToken token)
-            {
-                Groups.Peek().Add(token);
-            }
-
-            public void Add(IEnumerable<ICilToken> tokens)
-            {
-                Groups.Peek().AddRange(tokens);
-            }
-
-            public void Push()
-            {
-                Groups.Push(new());
-            }
-
-            public List<ICilToken> Pop()
-            {
-                return Groups.Pop();
             }
         }
     }

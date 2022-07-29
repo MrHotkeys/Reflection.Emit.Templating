@@ -1,5 +1,6 @@
 using System;
 using System.Reflection;
+using System.Reflection.Emit;
 
 namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
 {
@@ -20,6 +21,10 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
             get => _method;
             set => _method = (MethodBase)(value ?? throw new ArgumentNullException(nameof(ICilInstruction.Operand)));
         }
+
+        public StackBehaviour StackBehaviourPop => StackBehaviour.Varpop;
+
+        public StackBehaviour StackBehaviourPush => StackBehaviour.Varpush;
 
         public CilCallInstruction(MethodBase method)
         {

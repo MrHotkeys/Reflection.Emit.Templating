@@ -1,4 +1,5 @@
 using System;
+using System.Reflection.Emit;
 
 namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
 {
@@ -30,6 +31,10 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
                 _index = x;
             }
         }
+
+        public StackBehaviour StackBehaviourPop => StackBehaviour.Pop1;
+
+        public StackBehaviour StackBehaviourPush => StackBehaviour.Push0;
 
         public CilStoreArgumentInstruction(int index)
         {
