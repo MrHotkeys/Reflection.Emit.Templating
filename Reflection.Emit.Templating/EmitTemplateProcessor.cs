@@ -8,11 +8,16 @@ using Microsoft.Extensions.Logging;
 
 using MrHotkeys.Reflection.Emit.Templating.Cil;
 using MrHotkeys.Reflection.Emit.Templating.Cil.Instructions;
+using MrHotkeys.Reflection.Emit.Templating.Extensions;
 
 namespace MrHotkeys.Reflection.Emit.Templating
 {
     public sealed class EmitTemplateProcessor
     {
+        private static Dictionary<string, object> StaticCaptures { get; } = new Dictionary<string, object>();
+
+        private static object StaticCapturesLock { get; } = new object();
+
         private ILogger Logger { get; }
 
         private ICilParser CilParser { get; }
@@ -26,51 +31,40 @@ namespace MrHotkeys.Reflection.Emit.Templating
             CilWriter = cilWriter ?? throw new ArgumentNullException(nameof(cilWriter));
         }
 
+        public static object GetStaticCapture(string key)
+        {
+            lock (StaticCapturesLock)
+            {
+                var captureTarget = StaticCaptures[key];
+                StaticCaptures.Remove(key);
+                return captureTarget;
+            }
+        }
+
         public void Process(TypeBuilder typeBuilder, ILGenerator il, bool outIsStatic, Func<EmitTemplateSurrogate, Delegate> callback)
         {
             var template = callback(EmitTemplateSurrogate.Instance);
             var templateBody = CilParser.ParseMethodBody(template.Method);
+
             var tokens = new Queue<ICilToken>(templateBody.Tokens);
+
             var context = new Context(
                 typeBuilder: typeBuilder,
                 callback: callback,
                 template: template,
-                argumentIndexOffset: GetArgIndexOffset(template.Method.IsStatic, outIsStatic));
-
-            if (callback.Target is not null)
-                AddCaptures(callback.Target, context.Captures);
-            if (template.Target is not null)
-                AddCaptures(template.Target, context.Captures);
+                argumentIndexOffset: GetArgIndexOffset(template.Method.IsStatic, outIsStatic)
+            );
 
             ProcessTokens(context, tokens);
 
             templateBody.Tokens = context.Result;
+            foreach (var local in context.Locals)
+                templateBody.Locals.Add(local);
 
             if (templateBody.Tokens[^1] is ICilInstruction lastInstruction && lastInstruction.InstructionType == CilInstructionType.Return)
                 templateBody.Tokens.RemoveAt(templateBody.Tokens.Count - 1);
 
             CilWriter.Write(il, templateBody);
-        }
-
-        private void AddCaptures(object target, Dictionary<MemberInfo, object?> captures)
-        {
-            foreach (var member in target.GetType().GetMembers())
-            {
-                object? value;
-                switch (member.MemberType)
-                {
-                    case MemberTypes.Field when member is FieldInfo field:
-                        value = field.GetValue(target);
-                        break;
-                    case MemberTypes.Property when member is PropertyInfo property:
-                        value = property.GetValue(target);
-                        break;
-                    default:
-                        continue;
-                }
-
-                captures[member] = value;
-            }
         }
 
         private int GetArgIndexOffset(bool templateIsStatic, bool destinationIsStatic)
@@ -137,9 +131,36 @@ namespace MrHotkeys.Reflection.Emit.Templating
             {
                 case CilInstructionType.LoadArgument when !context.Template.Method.IsStatic && instruction is CilLoadArgumentInstruction ldarg && ldarg.Index == 0:
                     {
-                        ProcessCapturesAccess(context, tokens, ldarg);
+                        ProcessTargetAccess(context, tokens);
                         break;
                     }
+
+                case CilInstructionType.LoadStaticField when instruction is CilLoadStaticFieldInstruction ldsfld &&
+                        (context.CallbackTargetFields.Contains(ldsfld.Field) || context.TemplateTargetFields.Contains(ldsfld.Field)):
+                    {
+                        ProcessLoadStaticField(context, tokens, ldsfld);
+                        break;
+                    }
+
+                case CilInstructionType.Call when instruction is CilCallInstruction call && call.Method.IsStatic &&
+                        (context.CallbackTargetPropertyGetters.Contains(call.Method) || context.TemplateTargetPropertyGetters.Contains(call.Method)):
+                    {
+                        ProcessCallStaticPropertyGetter(context, tokens, call);
+                        break;
+                    }
+
+                case CilInstructionType.StoreField when instruction is CilStoreFieldInstruction stfld &&
+                        (context.CallbackTargetFields.Contains(stfld.Field) || context.TemplateTargetFields.Contains(stfld.Field)):
+                    throw new InvalidOperationException();
+
+                case CilInstructionType.StoreStaticField when instruction is CilStoreStaticFieldInstruction stsfld &&
+                        (context.CallbackTargetFields.Contains(stsfld.Field) || context.TemplateTargetFields.Contains(stsfld.Field)):
+                    throw new InvalidOperationException();
+
+                case CilInstructionType.Call when instruction is CilCallInstruction call &&
+                        (context.CallbackTargetPropertySetters.Contains(call.Method) || context.TemplateTargetPropertySetters.Contains(call.Method)):
+                    throw new InvalidOperationException();
+
                 default:
                     {
                         if (instruction.OperandType == CilOperandType.ArgumentIndex)
@@ -156,57 +177,54 @@ namespace MrHotkeys.Reflection.Emit.Templating
             }
         }
 
-        private void ProcessCapturesAccess(Context context, Queue<ICilToken> tokens, CilLoadArgumentInstruction ldarg)
+        private void ProcessTargetAccess(Context context, Queue<ICilToken> tokens)
         {
-            if (tokens.Dequeue() is not CilLoadFieldInstruction ldfld)
-                throw new InvalidOperationException();
-
-            if (ldfld.Field.FieldType == typeof(EmitTemplateSurrogate))
+            switch (tokens.Dequeue())
             {
-                var surrogateInstructions = LookAheadToSurrogateMethodCall(tokens);
-                var call = (CilCallInstruction)surrogateInstructions.Pop();
-                var argInstructions = GroupArgInstructions(call.Method, surrogateInstructions);
+                case CilLoadFieldInstruction ldfld when ldfld.Field.FieldType == typeof(EmitTemplateSurrogate):
+                    {
+                        var surrogateInstructions = LookAheadToSurrogateMethodCall(tokens);
+                        var call = (CilCallInstruction)surrogateInstructions.Pop();
+                        var argInstructions = GroupArgInstructions(call.Method, surrogateInstructions);
 
-                // Make sure all instructions we sent in got consumed, shouldn't have any extras since we already found the target for the call (ldfld)
-                if (surrogateInstructions.Count > 0)
+                        // Make sure all instructions we sent in got consumed, shouldn't have any extras since we already found the target for the call (ldfld)
+                        if (surrogateInstructions.Count > 0)
+                            throw new InvalidOperationException();
+
+                        ProcessSurrogateMethod(context, (MethodInfo)call.Method, argInstructions);
+
+                        break;
+                    }
+
+                case CilLoadFieldInstruction ldfld when ldfld.Field.DeclaringType == context.TemplateTargetType:
+                    {
+                        if (ldfld.Field.FieldType == context.CallbackTargetType)
+                            ProcessTargetAccess(context, tokens);
+                        else
+                            ProcessLoadFieldFromTarget(context, tokens, ldfld, context.Template.Target);
+                        break;
+                    }
+
+                case CilLoadFieldInstruction ldfld when ldfld.Field.DeclaringType == context.CallbackTargetType:
+                    {
+                        ProcessLoadFieldFromTarget(context, tokens, ldfld, context.Callback.Target);
+                        break;
+                    }
+
+                case CilCallInstruction call when context.CallbackTargetPropertyGetters.Contains(call.Method):
+                    {
+                        ProcessCallPropertyGetterOnTarget(context, tokens, call, context.Callback.Target);
+                        break;
+                    }
+
+                case CilCallInstruction call when context.TemplateTargetPropertyGetters.Contains(call.Method):
+                    {
+                        ProcessCallPropertyGetterOnTarget(context, tokens, call, context.Template.Target);
+                        break;
+                    }
+
+                default:
                     throw new InvalidOperationException();
-
-                ProcessSurrogateMethod(context, (MethodInfo)call.Method, argInstructions);
-            }
-            else
-            {
-                // Check if we're in outer or inner capture
-                if (ldfld.Field.FieldType == context.Callback.Target?.GetType())
-                {
-                    // Load inner capture from outer capture
-                    if (tokens.Dequeue() is not CilLoadFieldInstruction ldfld_inner)
-                        throw new InvalidOperationException();
-
-                    ldfld = ldfld_inner;
-                }
-
-                if (ldfld.Field.DeclaringType != context.Callback.Target?.GetType())
-                    throw new InvalidOperationException();
-
-                var capture = context.Captures[ldfld.Field];
-                ICilInstruction instruction = capture switch
-                {
-                    null => new CilRawInstruction(OpCodes.Ldnull),
-                    bool b => new CilRawInstruction(b ? OpCodes.Ldc_I4_1 : OpCodes.Ldc_I4_0),
-                    sbyte sb => new CilRawInstruction(OpCodes.Ldc_I4_S, sb),
-                    byte b => new CilRawInstruction(OpCodes.Ldc_I4, b),
-                    short s => new CilRawInstruction(OpCodes.Ldc_I4, s),
-                    ushort us => new CilRawInstruction(OpCodes.Ldc_I4, us),
-                    int i => new CilRawInstruction(OpCodes.Ldc_I4, i),
-                    uint ui => new CilRawInstruction(OpCodes.Ldc_I4, ui),
-                    long l => new CilRawInstruction(OpCodes.Ldc_I8, l),
-                    ulong ul => new CilRawInstruction(OpCodes.Ldc_I8, ul),
-                    float f => new CilRawInstruction(OpCodes.Ldc_R4, f),
-                    double d => new CilRawInstruction(OpCodes.Ldc_R8, d),
-                    string s => new CilRawInstruction(OpCodes.Ldstr, s),
-                    _ => throw new NotSupportedException($"Captured value \"{ldfld.Field.Name}\" has unsupported non-primitive type {capture.GetType()}!"),
-                };
-                context.Result.Add(instruction);
             }
         }
 
@@ -240,7 +258,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
             if (argsInstructions.Count != parameters.Length)
                 throw new InvalidOperationException();
 
-            var capture = GetCaptureArg(context, argsInstructions.Dequeue());
+            var capture = GetArgValue(context, argsInstructions.Dequeue());
             if (capture is null)
                 throw new InvalidOperationException();
 
@@ -295,7 +313,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
             if (argsInstructions.Count != parameters.Length)
                 throw new InvalidOperationException();
 
-            var capture = GetCaptureArg(context, argsInstructions.Dequeue());
+            var capture = GetArgValue(context, argsInstructions.Dequeue());
             if (capture is null)
                 throw new InvalidOperationException();
 
@@ -357,7 +375,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
             if (argsInstructions.Count != parameters.Length)
                 throw new InvalidOperationException();
 
-            var capture = GetCaptureArg(context, argsInstructions.Dequeue());
+            var capture = GetArgValue(context, argsInstructions.Dequeue());
             if (capture is null)
                 throw new InvalidOperationException();
 
@@ -399,7 +417,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
             var methodSourceType = parameters[0].ParameterType;
             if (methodSourceType == typeof(MethodInfo))
             {
-                var method = (MethodInfo)GetCaptureArg(context, argsInstructions.Dequeue())!;
+                var method = (MethodInfo)GetArgValue(context, argsInstructions.Dequeue())!;
 
                 if (!method.IsStatic)
                     context.Result.Add(new CilLoadArgumentInstruction(0));
@@ -618,29 +636,234 @@ namespace MrHotkeys.Reflection.Emit.Templating
             return false;
         }
 
-        private object? GetCaptureArg(Context context, Queue<ICilInstruction> argInstructions)
+        private object? GetLoadFieldFromTargetValue<T>(Context context, Queue<T> tokens, CilLoadFieldInstruction ldfld, object target)
+            where T : ICilToken
         {
-            if (argInstructions.Dequeue() is not CilLoadArgumentInstruction ldarg || ldarg.Index != 0)
-                throw new InvalidOperationException();
-            if (argInstructions.Dequeue() is not CilLoadFieldInstruction ldfld)
-                throw new InvalidOperationException();
-
-            // Check if we're in outer or inner capture
-            if (ldfld.Field.FieldType == context.Callback.Target?.GetType())
+            if (!context.CaptureValues.TryGetValue(ldfld.Field, out var value))
             {
-                if (argInstructions.Dequeue() is not CilLoadFieldInstruction ldfld_inner)
-                    throw new InvalidOperationException();
-
-                ldfld = ldfld_inner;
+                value = ldfld.Field.GetValue(target);
+                context.CaptureValues.Add(ldfld.Field, value);
             }
 
-            if (ldfld.Field.DeclaringType != context.Callback.Target?.GetType())
-                throw new InvalidOperationException();
+            return value;
+        }
+
+        private void ProcessLoadFieldFromTarget<T>(Context context, Queue<T> tokens, CilLoadFieldInstruction ldfld, object target)
+            where T : ICilToken
+        {
+            var value = GetLoadFieldFromTargetValue(context, tokens, ldfld, target);
+            ProcessTargetValue(context, ldfld.Field, value);
+        }
+
+        private object? GetLoadStaticFieldValue<T>(Context context, Queue<T> tokens, CilLoadStaticFieldInstruction ldsfld)
+            where T : ICilToken
+        {
+            if (!context.CaptureValues.TryGetValue(ldsfld.Field, out var value))
+            {
+                value = ldsfld.Field.GetValue(null);
+                context.CaptureValues.Add(ldsfld.Field, value);
+            }
+
+            return value;
+        }
+
+        private void ProcessLoadStaticField<T>(Context context, Queue<T> tokens, CilLoadStaticFieldInstruction ldsfld)
+            where T : ICilToken
+        {
+            var value = GetLoadStaticFieldValue(context, tokens, ldsfld);
+            ProcessTargetValue(context, ldsfld.Field, value);
+        }
+
+        private void ProcessCallStaticPropertyGetter<T>(Context context, Queue<T> tokens, CilCallInstruction call)
+            where T : ICilToken
+        {
+            var value = GetCallStaticPropertyGetterValue(context, tokens, call);
+            ProcessTargetValue(context, call.Method, value);
+        }
+
+        private object? GetCallStaticPropertyGetterValue<T>(Context context, Queue<T> tokens, CilCallInstruction call)
+            where T : ICilToken
+        {
+            if (!context.CaptureValues.TryGetValue(call.Method, out var value))
+            {
+                if (call.Method.GetParameters().Length > 0)
+                    throw new InvalidOperationException();
+
+                value = call.Method.Invoke(null, Array.Empty<object>());
+                context.CaptureValues.Add(call.Method, value);
+            }
+
+            return value;
+        }
+
+        private object? GetCallPropertyGetterOnTargetValue<T>(Context context, Queue<T> tokens, CilCallInstruction call, object target)
+            where T : ICilToken
+        {
+            if (!context.CaptureValues.TryGetValue(call.Method, out var value))
+            {
+                if (call.Method.GetParameters().Length > 0)
+                    throw new InvalidOperationException();
+
+                value = call.Method.Invoke(target, Array.Empty<object>());
+                context.CaptureValues.Add(call.Method, value);
+            }
+
+            return value;
+        }
+
+        private void ProcessCallPropertyGetterOnTarget<T>(Context context, Queue<T> tokens, CilCallInstruction call, object target)
+            where T : ICilToken
+        {
+            var value = GetCallPropertyGetterOnTargetValue(context, tokens, call, target);
+            ProcessTargetValue(context, call.Method, value);
+        }
+
+        private object? GetArgValue(Context context, Queue<ICilInstruction> argInstructions)
+        {
+            if (argInstructions.Dequeue() is CilLoadArgumentInstruction ldarg)
+            {
+                if (ldarg.Index != 0)
+                    throw new InvalidOperationException();
+
+                return GetArgValueFromTarget(context, argInstructions);
+            }
+            else
+            {
+                return GetArgValueFromStatic(context, argInstructions);
+            }
+        }
+
+        private object? GetArgValueFromTarget(Context context, Queue<ICilInstruction> argInstructions)
+        {
+            var value = argInstructions.Dequeue() switch
+            {
+                CilLoadFieldInstruction ldfld when ldfld.Field.DeclaringType == context.TemplateTargetType =>
+                    ldfld.Field.FieldType == context.CallbackTargetType ?
+                    GetArgValueFromTarget(context, argInstructions) :
+                    GetLoadFieldFromTargetValue(context, argInstructions, ldfld, context.Template.Target),
+
+                CilLoadFieldInstruction ldfld when ldfld.Field.DeclaringType == context.CallbackTargetType =>
+                    GetLoadFieldFromTargetValue(context, argInstructions, ldfld, context.Callback.Target),
+
+                CilCallInstruction call when context.CallbackTargetPropertyGetters.Contains(call.Method) =>
+                    GetCallPropertyGetterOnTargetValue(context, argInstructions, call, context.Callback.Target),
+
+                CilCallInstruction call when context.TemplateTargetPropertyGetters.Contains(call.Method) =>
+                    GetCallPropertyGetterOnTargetValue(context, argInstructions, call, context.Template.Target),
+
+                _ => throw new InvalidOperationException(),
+            };
 
             if (argInstructions.Count > 0)
                 throw new InvalidOperationException();
 
-            return context.Captures[ldfld.Field];
+            return value;
+        }
+
+        private object? GetArgValueFromStatic(Context context, Queue<ICilInstruction> argInstructions)
+        {
+            var value = argInstructions.Dequeue() switch
+            {
+                CilLoadStaticFieldInstruction ldsfld when context.CallbackTargetFields.Contains(ldsfld.Field) || context.TemplateTargetFields.Contains(ldsfld.Field) =>
+                    GetLoadStaticFieldValue(context, argInstructions, ldsfld),
+
+                CilCallInstruction call when context.CallbackTargetPropertyGetters.Contains(call.Method) || context.TemplateTargetPropertyGetters.Contains(call.Method) =>
+                    GetCallStaticPropertyGetterValue(context, argInstructions, call),
+
+                _ => throw new InvalidOperationException(),
+            };
+
+            if (argInstructions.Count > 0)
+                throw new InvalidOperationException();
+
+            return value;
+        }
+
+        private void ProcessTargetValue(Context context, MemberInfo member, object? value)
+        {
+            ICilInstruction instruction = value switch
+            {
+                null => new CilRawInstruction(OpCodes.Ldnull),
+                bool b => new CilRawInstruction(b ? OpCodes.Ldc_I4_1 : OpCodes.Ldc_I4_0),
+                sbyte sb => new CilRawInstruction(OpCodes.Ldc_I4_S, sb),
+                byte b => new CilRawInstruction(OpCodes.Ldc_I4, b),
+                short s => new CilRawInstruction(OpCodes.Ldc_I4, s),
+                ushort us => new CilRawInstruction(OpCodes.Ldc_I4, us),
+                int i => new CilRawInstruction(OpCodes.Ldc_I4, i),
+                uint ui => new CilRawInstruction(OpCodes.Ldc_I4, ui),
+                long l => new CilRawInstruction(OpCodes.Ldc_I8, l),
+                ulong ul => new CilRawInstruction(OpCodes.Ldc_I8, ul),
+                float f => new CilRawInstruction(OpCodes.Ldc_R4, f),
+                double d => new CilRawInstruction(OpCodes.Ldc_R8, d),
+                string s => new CilRawInstruction(OpCodes.Ldstr, s),
+                _ => GetStaticCapture(context, member, value),
+            };
+            context.Result.Add(instruction);
+        }
+
+        private ICilInstruction GetStaticCapture(Context context, MemberInfo member, object value)
+        {
+            if (!context.StaticCaptureMaps.TryGetValue(member, out var propertyBuilder))
+            {
+                var type = value.GetType();
+                var propertyName = $"{member.DeclaringType}.{member.Name}";
+
+                var backingFieldBuilder = context.TypeBuilder.DefineField(
+                    fieldName: $"<{propertyName}>k__BackingField",
+                    type: type,
+                    attributes: FieldAttributes.Private | FieldAttributes.Static
+                );
+
+                // Used to keep track of whether the code has run to pull the value for this capture from the static capture dictionary
+                var claimedBuilder = context.TypeBuilder.DefineField(
+                    fieldName: $"<{propertyName}>k__Claimed",
+                    type: typeof(bool),
+                    attributes: FieldAttributes.Private | FieldAttributes.Static
+                );
+
+                propertyBuilder = context.TypeBuilder.DefineProperty(
+                    name: propertyName,
+                    attributes: PropertyAttributes.None,
+                    callingConvention: CallingConventions.Standard,
+                    returnType: type,
+                    parameterTypes: Array.Empty<Type>()
+                );
+
+                var getterBuilder = context.TypeBuilder.DefineMethod(
+                    name: $"get_{propertyName}",
+                    attributes: MethodAttributes.Private | MethodAttributes.Static,
+                    callingConvention: CallingConventions.Standard,
+                    returnType: type,
+                    parameterTypes: Array.Empty<Type>()
+                );
+
+                var il = getterBuilder.GetILGenerator();
+
+                var returnLabel = il.DefineLabel();
+                il.Emit(OpCodes.Ldsfld, claimedBuilder);
+                il.Emit(OpCodes.Brtrue, returnLabel);
+
+                il.Emit(OpCodes.Ldstr, propertyName);
+                il.Emit(OpCodes.Call, typeof(EmitTemplateProcessor).GetMethod(nameof(GetStaticCapture)));
+                il.Emit(OpCodes.Stsfld, backingFieldBuilder);
+                il.Emit(OpCodes.Ldc_I4_1);
+                il.Emit(OpCodes.Stsfld, claimedBuilder);
+
+                il.MarkLabel(returnLabel);
+                il.Emit(OpCodes.Ldsfld, backingFieldBuilder);
+                il.Emit(OpCodes.Ret);
+
+                propertyBuilder.SetGetMethod(getterBuilder);
+
+                StaticCaptures.Add(propertyName, value);
+
+                lock (StaticCapturesLock)
+                {
+                    context.StaticCaptureMaps.Add(member, propertyBuilder);
+                }
+            }
+
+            return new CilCallInstruction(propertyBuilder.GetMethod);
         }
 
         private void ProcessArgsInstructions(Context context, Queue<Queue<ICilInstruction>> argsInstructions)
@@ -655,12 +878,33 @@ namespace MrHotkeys.Reflection.Emit.Templating
 
             public Delegate Callback { get; }
 
+            public Type? CallbackTargetType { get; }
+
+            public HashSet<FieldInfo> CallbackTargetFields { get; }
+
+            public HashSet<MethodInfo> CallbackTargetPropertyGetters { get; }
+
+            public HashSet<MethodInfo> CallbackTargetPropertySetters { get; }
+
             public Delegate Template { get; }
+
+            public Type? TemplateTargetType { get; }
+
+            public HashSet<FieldInfo> TemplateTargetFields { get; }
+
+            public HashSet<MethodInfo> TemplateTargetPropertyGetters { get; }
+
+            public HashSet<MethodInfo> TemplateTargetPropertySetters { get; }
+
             public int ArugmentIndexOffset { get; }
 
-            public Dictionary<MemberInfo, object?> Captures { get; } = new();
+            public List<ICilLocalVariable> Locals { get; } = new();
 
             public List<ICilToken> Result { get; } = new();
+
+            public Dictionary<MemberInfo, object?> CaptureValues { get; } = new();
+
+            public Dictionary<MemberInfo, PropertyBuilder> StaticCaptureMaps { get; } = new();
 
             public Context(TypeBuilder typeBuilder, Delegate callback, Delegate template, int argumentIndexOffset)
             {
@@ -668,6 +912,40 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 Callback = callback ?? throw new ArgumentNullException(nameof(callback));
                 Template = template ?? throw new ArgumentNullException(nameof(template));
                 ArugmentIndexOffset = argumentIndexOffset;
+
+                const BindingFlags Flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+                CallbackTargetType = Callback.Target?.GetType();
+                CallbackTargetFields = CallbackTargetType?
+                    .GetFields(Flags)
+                    .ToHashSet()
+                    ?? new HashSet<FieldInfo>();
+                CallbackTargetPropertyGetters = CallbackTargetType?
+                    .GetProperties(Flags)
+                    .Select(p => p.GetMethod)
+                    .ToHashSet()
+                    ?? new HashSet<MethodInfo>();
+                CallbackTargetPropertySetters = CallbackTargetType?
+                    .GetProperties(Flags)
+                    .Select(p => p.SetMethod)
+                    .ToHashSet()
+                    ?? new HashSet<MethodInfo>();
+
+                TemplateTargetType = Template.Target?.GetType();
+                TemplateTargetFields = TemplateTargetType?
+                    .GetFields(Flags)
+                    .ToHashSet()
+                    ?? new HashSet<FieldInfo>();
+                TemplateTargetPropertyGetters = TemplateTargetType?
+                    .GetProperties(Flags)
+                    .Select(p => p.GetMethod)
+                    .ToHashSet()
+                    ?? new HashSet<MethodInfo>();
+                TemplateTargetPropertySetters = TemplateTargetType?
+                    .GetProperties(Flags)
+                    .Select(p => p.SetMethod)
+                    .ToHashSet()
+                    ?? new HashSet<MethodInfo>();
             }
         }
     }

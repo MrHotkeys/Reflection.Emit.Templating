@@ -4,9 +4,9 @@ using System.Reflection.Emit;
 
 namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
 {
-    public sealed class CilStoreFieldInstruction : ICilInstruction, IHasFieldOperand
+    public sealed class CilLoadStaticFieldInstruction : ICilInstruction, IHasFieldOperand
     {
-        CilInstructionType ICilInstruction.InstructionType => CilInstructionType.StoreField;
+        CilInstructionType ICilInstruction.InstructionType => CilInstructionType.LoadStaticField;
 
         private FieldInfo _field;
 
@@ -22,20 +22,20 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
             set => _field = (FieldInfo)(value ?? throw new ArgumentNullException(nameof(ICilInstruction.Operand)));
         }
 
-        public StackBehaviour StackBehaviourPop => StackBehaviour.Pop1_pop1;
+        public StackBehaviour StackBehaviourPop => StackBehaviour.Pop0;
 
-        public StackBehaviour StackBehaviourPush => StackBehaviour.Push0;
+        public StackBehaviour StackBehaviourPush => StackBehaviour.Push1;
 
-        public CilStoreFieldInstruction(FieldInfo field)
+        public CilLoadStaticFieldInstruction(FieldInfo field)
         {
             if (field is null)
                 throw new ArgumentNullException(nameof(field));
-            if (field.IsStatic)
-                throw new ArgumentException("May not be static!", nameof(field));
+            if (!field.IsStatic)
+                throw new ArgumentException("Must be static!", nameof(field));
 
             _field = field;
         }
 
-        public override string ToString() => $"Store Field {Field}";
+        public override string ToString() => $"Load Static Field {Field}";
     }
 }

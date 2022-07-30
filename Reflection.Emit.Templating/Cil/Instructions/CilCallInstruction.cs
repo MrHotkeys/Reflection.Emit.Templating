@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 
@@ -31,6 +32,13 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
             _method = method ?? throw new ArgumentNullException(nameof(method));
         }
 
-        public override string ToString() => $"Call {Method}";
+        public override string ToString()
+        {
+            var parameterStrings = Method
+                .GetParameters()
+                .Select(p => $"{p.ParameterType} {p.Name}");
+
+            return $"Call {Method}({string.Join(", ", parameterStrings)})";
+        }
     }
 }

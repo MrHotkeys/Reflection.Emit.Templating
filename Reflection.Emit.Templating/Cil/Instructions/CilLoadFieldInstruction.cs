@@ -28,7 +28,12 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
 
         public CilLoadFieldInstruction(FieldInfo field)
         {
-            _field = field ?? throw new ArgumentNullException(nameof(field));
+            if (field is null)
+                throw new ArgumentNullException(nameof(field));
+            if (field.IsStatic)
+                throw new ArgumentException("May not be static!", nameof(field));
+
+            _field = field;
         }
 
         public override string ToString() => $"Load Field {Field}";

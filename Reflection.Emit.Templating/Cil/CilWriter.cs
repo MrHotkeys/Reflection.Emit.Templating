@@ -149,11 +149,25 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                         WriteLoadFieldInstruction(il, context, ldfld);
                         break;
                     }
+                case CilInstructionType.LoadStaticField:
+                    {
+                        if (instruction is not CilLoadStaticFieldInstruction ldsfld)
+                            throw new InvalidOperationException();
+                        WriteLoadStaticFieldInstruction(il, context, ldsfld);
+                        break;
+                    }
                 case CilInstructionType.StoreField:
                     {
                         if (instruction is not CilStoreFieldInstruction stfld)
                             throw new InvalidOperationException();
                         WriteStoreFieldInstruction(il, context, stfld);
+                        break;
+                    }
+                case CilInstructionType.StoreStaticField:
+                    {
+                        if (instruction is not CilStoreStaticFieldInstruction stsfld)
+                            throw new InvalidOperationException();
+                        WriteStoreStaticFieldInstruction(il, context, stsfld);
                         break;
                     }
                 case CilInstructionType.Return:
@@ -332,9 +346,19 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
             EmitAndLog(il, OpCodes.Ldfld, ldfld.Field);
         }
 
+        private void WriteLoadStaticFieldInstruction(ILGenerator il, Context context, CilLoadStaticFieldInstruction ldsfld)
+        {
+            EmitAndLog(il, OpCodes.Ldsfld, ldsfld.Field);
+        }
+
         private void WriteStoreFieldInstruction(ILGenerator il, Context context, CilStoreFieldInstruction stfld)
         {
             EmitAndLog(il, OpCodes.Stfld, stfld.Field);
+        }
+
+        private void WriteStoreStaticFieldInstruction(ILGenerator il, Context context, CilStoreStaticFieldInstruction stsfld)
+        {
+            EmitAndLog(il, OpCodes.Stsfld, stsfld.Field);
         }
 
         private void WriteReturnInstruction(ILGenerator il, Context context, CilReturnInstruction ret)
@@ -494,7 +518,20 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
         private void EmitAndLog(ILGenerator il, OpCode opCode, MethodInfo operand)
         {
             if (EmitLogLevel.HasValue && Logger.IsEnabled(EmitLogLevel.Value))
-                Logger.Log(EmitLogLevel.Value, $"{opCode.Name} {operand.ReturnType.Name ?? "void"} {operand.DeclaringType}.{operand.Name}");
+            {
+                if (operand is MethodBuilder methodBuilder)
+                {
+                    Logger.Log(EmitLogLevel.Value, $"{opCode.Name} {operand.ReturnType.Name ?? "void"} {operand.DeclaringType}.{operand.Name}(...) (Builder)");
+                }
+                else
+                {
+                    var parameterStrings = operand
+                        .GetParameters()
+                        .Select(p => $"{p.ParameterType} {p.Name}");
+
+                    Logger.Log(EmitLogLevel.Value, $"{opCode.Name} {operand.ReturnType.Name ?? "void"} {operand.DeclaringType}.{operand.Name}({string.Join(", ", parameterStrings)})");
+                }
+            }
             il.Emit(opCode, operand);
         }
 
