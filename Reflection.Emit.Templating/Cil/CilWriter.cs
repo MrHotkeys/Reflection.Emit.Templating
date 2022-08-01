@@ -434,7 +434,33 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                     break;
 
                 case OperandType.InlineTok:
-                    throw new NotImplementedException();
+                    {
+                        switch (raw.Operand)
+                        {
+                            case Type type:
+                                EmitAndLog(il, opCode, type);
+                                break;
+                            case FieldInfo field:
+                                EmitAndLog(il, opCode, field);
+                                break;
+                            case MethodInfo method:
+                                EmitAndLog(il, opCode, method);
+                                break;
+                            case MemberInfo member:
+                                EmitAndLog(il, opCode, member);
+                                break;
+                            case string str:
+                                EmitAndLog(il, opCode, str);
+                                break;
+                            case SignatureHelper signature:
+                                EmitAndLog(il, opCode, signature);
+                                break;
+                            default:
+                                throw new NotSupportedException();
+                        }
+
+                        break;
+                    }
 
                 case OperandType.InlinePhi:
                     throw new NotSupportedException();
@@ -508,6 +534,13 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
             il.Emit(opCode, operand);
         }
 
+        private void EmitAndLog(ILGenerator il, OpCode opCode, SignatureHelper operand)
+        {
+            if (EmitLogLevel.HasValue && Logger.IsEnabled(EmitLogLevel.Value))
+                Logger.Log(EmitLogLevel.Value, $"{opCode.Name} {operand}");
+            il.Emit(opCode, operand);
+        }
+
         private void EmitAndLog(ILGenerator il, OpCode opCode, FieldInfo operand)
         {
             if (EmitLogLevel.HasValue && Logger.IsEnabled(EmitLogLevel.Value))
@@ -540,6 +573,24 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
             if (EmitLogLevel.HasValue && Logger.IsEnabled(EmitLogLevel.Value))
                 Logger.Log(EmitLogLevel.Value, $"{opCode.Name} {operand.DeclaringType}");
             il.Emit(opCode, operand);
+        }
+
+        public void EmitAndLog(ILGenerator il, OpCode opCode, MemberInfo operand)
+        {
+            switch (operand.MemberType)
+            {
+                case MemberTypes.Constructor:
+                    EmitAndLog(il, opCode, (ConstructorInfo)operand);
+                    break;
+                case MemberTypes.Field:
+                    EmitAndLog(il, opCode, (FieldInfo)operand);
+                    break;
+                case MemberTypes.Method:
+                    EmitAndLog(il, opCode, (MethodInfo)operand);
+                    break;
+                default:
+                    throw new NotSupportedException();
+            }
         }
 
         private sealed class Context

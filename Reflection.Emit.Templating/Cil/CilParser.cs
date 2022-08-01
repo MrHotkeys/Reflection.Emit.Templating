@@ -203,7 +203,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
 
                 OperandType.InlineSwitch => ParseOperandUInt(ref bytes),
 
-                OperandType.InlineTok => throw new NotImplementedException(),
+                OperandType.InlineTok => ParseOperandMetadataToken(ref bytes, module),
 
                 OperandType.InlinePhi => throw new NotSupportedException(),
 
@@ -293,8 +293,32 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
 
         public byte[] ParseOperandSignature(ref ReadOnlySpan<byte> bytes, Module module)
         {
+            Logger.LogWarning($"Resolving signature as {typeof(byte[]).Name} - writing  is unsupported unless converted to {nameof(SignatureHelper)}!");
             var token = ParseOperandInt(ref bytes);
             return module.ResolveSignature(token);
+        }
+
+        public MemberInfo ParseOperandMember(ref ReadOnlySpan<byte> bytes, Module module)
+        {
+            var token = ParseOperandInt(ref bytes);
+            return module.ResolveMember(token);
+        }
+
+        public object ParseOperandMetadataToken(ref ReadOnlySpan<byte> bytes, Module module)
+        {
+            // Most significant byte of token defines type
+            var mostSignificantByteIndex = BitConverter.IsLittleEndian ? 3 : 0;
+            var tokenType = (CilMetadataTokenType)bytes[mostSignificantByteIndex];
+            return tokenType switch
+            {
+                CilMetadataTokenType.Type => ParseOperandType(ref bytes, module),
+                CilMetadataTokenType.Field => ParseOperandField(ref bytes, module),
+                CilMetadataTokenType.Method => ParseOperandMethod(ref bytes, module),
+                CilMetadataTokenType.Member => ParseOperandMember(ref bytes, module),
+                CilMetadataTokenType.Signature => ParseOperandSignature(ref bytes, module),
+                CilMetadataTokenType.String => ParseOperandString(ref bytes, module),
+                _ => throw new NotSupportedException(),
+            };
         }
     }
 }
