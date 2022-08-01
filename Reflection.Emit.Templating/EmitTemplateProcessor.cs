@@ -807,6 +807,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
             {
                 var type = value.GetType();
                 var propertyName = $"{member.DeclaringType}.{member.Name}";
+                var staticCapturesKey = $"({context.Guid}) {propertyName}";
 
                 var backingFieldBuilder = context.TypeBuilder.DefineField(
                     fieldName: $"<{propertyName}>k__BackingField",
@@ -843,7 +844,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 il.Emit(OpCodes.Ldsfld, claimedBuilder);
                 il.Emit(OpCodes.Brtrue, returnLabel);
 
-                il.Emit(OpCodes.Ldstr, propertyName);
+                il.Emit(OpCodes.Ldstr, staticCapturesKey);
                 il.Emit(OpCodes.Call, typeof(EmitTemplateProcessor).GetMethod(nameof(GetStaticCapture)));
                 il.Emit(OpCodes.Stsfld, backingFieldBuilder);
                 il.Emit(OpCodes.Ldc_I4_1);
@@ -855,12 +856,12 @@ namespace MrHotkeys.Reflection.Emit.Templating
 
                 propertyBuilder.SetGetMethod(getterBuilder);
 
-                StaticCaptures.Add(propertyName, value);
-
                 lock (StaticCapturesLock)
                 {
-                    context.StaticCaptureMaps.Add(member, propertyBuilder);
+                    StaticCaptures.Add(staticCapturesKey, value);
                 }
+
+                context.StaticCaptureMaps.Add(member, propertyBuilder);
             }
 
             return new CilCallInstruction(propertyBuilder.GetMethod);
@@ -905,6 +906,8 @@ namespace MrHotkeys.Reflection.Emit.Templating
             public Dictionary<MemberInfo, object?> CaptureValues { get; } = new();
 
             public Dictionary<MemberInfo, PropertyBuilder> StaticCaptureMaps { get; } = new();
+
+            public Guid Guid { get; } = Guid.NewGuid();
 
             public Context(TypeBuilder typeBuilder, Delegate callback, Delegate template, int argumentIndexOffset)
             {
