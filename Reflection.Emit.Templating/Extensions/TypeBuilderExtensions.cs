@@ -43,7 +43,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Extensions
         }
 
         public static PropertyBuilder DefineAutoProperty(this TypeBuilder typeBuilder, string name,
-            Type type, Accessibility setterAccess, Accessibility getterAccess)
+            Type type, MethodAttributes setterAttributes, MethodAttributes getterAttributes)
         {
             if (typeBuilder is null)
                 throw new ArgumentNullException(nameof(typeBuilder));
@@ -61,16 +61,19 @@ namespace MrHotkeys.Reflection.Emit.Templating.Extensions
                 parameterTypes: Type.EmptyTypes
             );
 
-            var getterBuilder = DefineAutoPropertyGetter(typeBuilder, name, type, setterAccess, backingFieldBuilder);
+            var getterBuilder = DefineAutoPropertyGetter(typeBuilder, name, type, setterAttributes, backingFieldBuilder);
             propertyBuilder.SetGetMethod(getterBuilder);
 
-            var setterBuilder = DefineAutoPropertySetter(typeBuilder, name, type, getterAccess, backingFieldBuilder);
+            var setterBuilder = DefineAutoPropertySetter(typeBuilder, name, type, getterAttributes, backingFieldBuilder);
             propertyBuilder.SetSetMethod(setterBuilder);
 
             return propertyBuilder;
         }
 
-        public static FieldBuilder DefineAutoPropertyBackingField(this TypeBuilder typeBuilder, string propertyName, Type type)
+        public static FieldBuilder DefineAutoPropertyBackingField(this TypeBuilder typeBuilder, string propertyName, Type type) =>
+            DefineAutoPropertyBackingField(typeBuilder, propertyName, type, FieldAttributes.Private);
+
+        public static FieldBuilder DefineAutoPropertyBackingField(this TypeBuilder typeBuilder, string propertyName, Type type, FieldAttributes attributes)
         {
             if (typeBuilder is null)
                 throw new ArgumentNullException(nameof(typeBuilder));
@@ -82,12 +85,12 @@ namespace MrHotkeys.Reflection.Emit.Templating.Extensions
             return typeBuilder.DefineField(
                 fieldName: $"<{propertyName}>k__BackingField",
                 type: type,
-                attributes: FieldAttributes.Private
+                attributes: attributes
             );
         }
 
         public static MethodBuilder DefineAutoPropertyGetter(this TypeBuilder typeBuilder, string propertyName,
-            Type type, Accessibility access, FieldBuilder backingFieldBuilder)
+            Type type, MethodAttributes attributes, FieldBuilder backingFieldBuilder)
         {
             if (typeBuilder is null)
                 throw new ArgumentNullException(nameof(typeBuilder));
@@ -98,7 +101,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Extensions
 
             var getterBuilder = typeBuilder.DefineMethod(
                 name: $"get_{propertyName}",
-                attributes: access.ToMethodAttributes() | MethodAttributes.Virtual,
+                attributes: attributes,
                 returnType: type,
                 parameterTypes: Type.EmptyTypes);
 
@@ -111,7 +114,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Extensions
         }
 
         public static MethodBuilder DefineAutoPropertySetter(this TypeBuilder typeBuilder, string propertyName,
-            Type type, Accessibility access, FieldBuilder backingFieldBuilder)
+            Type type, MethodAttributes attributes, FieldBuilder backingFieldBuilder)
         {
             if (typeBuilder is null)
                 throw new ArgumentNullException(nameof(typeBuilder));
@@ -122,7 +125,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Extensions
 
             var setterBuilder = typeBuilder.DefineMethod(
                 name: $"set_{propertyName}",
-                attributes: access.ToMethodAttributes() | MethodAttributes.Virtual,
+                attributes: attributes,
                 returnType: null,
                 parameterTypes: new[] { type });
 

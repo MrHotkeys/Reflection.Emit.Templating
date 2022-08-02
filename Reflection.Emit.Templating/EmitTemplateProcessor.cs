@@ -816,11 +816,10 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 var propertyName = $"{member.DeclaringType}.{member.Name}";
                 var staticCapturesKey = $"({context.Guid}) {propertyName}";
 
-                var backingFieldBuilder = context.TypeBuilder.DefineField(
-                    fieldName: $"<{propertyName}>k__BackingField",
+                var backingFieldBuilder = context.TypeBuilder.DefineAutoPropertyBackingField(
+                    propertyName: propertyName,
                     type: type,
-                    attributes: FieldAttributes.Private | FieldAttributes.Static
-                );
+                    attributes: FieldAttributes.Private | FieldAttributes.Static);
 
                 // Used to keep track of whether the code has run to pull the value for this capture from the static capture dictionary
                 var claimedBuilder = context.TypeBuilder.DefineField(
