@@ -891,6 +891,8 @@ namespace MrHotkeys.Reflection.Emit.Templating
 
                 il.Emit(OpCodes.Ldstr, staticCapturesKey);
                 il.Emit(OpCodes.Call, typeof(EmitTemplateProcessor).GetMethod(nameof(GetStaticCapture)));
+                if (type.IsValueType)
+                    il.Emit(OpCodes.Unbox_Any, type);
                 il.Emit(OpCodes.Stsfld, backingFieldBuilder);
                 il.Emit(OpCodes.Ldc_I4_1);
                 il.Emit(OpCodes.Stsfld, claimedBuilder);
