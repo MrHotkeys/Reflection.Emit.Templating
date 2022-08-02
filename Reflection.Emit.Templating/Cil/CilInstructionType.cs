@@ -10,6 +10,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
         StoreLocal,
         Branch,
         LoadField,
+        LoadFieldAddress,
         LoadStaticField,
         StoreField,
         StoreStaticField,

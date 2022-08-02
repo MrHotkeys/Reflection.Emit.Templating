@@ -149,6 +149,13 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                         WriteLoadFieldInstruction(il, context, ldfld);
                         break;
                     }
+                case CilInstructionType.LoadFieldAddress:
+                    {
+                        if (instruction is not CilLoadFieldAddressInstruction ldflda)
+                            throw new InvalidOperationException();
+                        WriteLoadFieldAddressInstruction(il, context, ldflda);
+                        break;
+                    }
                 case CilInstructionType.LoadStaticField:
                     {
                         if (instruction is not CilLoadStaticFieldInstruction ldsfld)
@@ -344,6 +351,11 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
         private void WriteLoadFieldInstruction(ILGenerator il, Context context, CilLoadFieldInstruction ldfld)
         {
             EmitAndLog(il, OpCodes.Ldfld, ldfld.Field);
+        }
+
+        private void WriteLoadFieldAddressInstruction(ILGenerator il, Context context, CilLoadFieldAddressInstruction ldflda)
+        {
+            EmitAndLog(il, OpCodes.Ldflda, ldflda.Field);
         }
 
         private void WriteLoadStaticFieldInstruction(ILGenerator il, Context context, CilLoadStaticFieldInstruction ldsfld)

@@ -123,6 +123,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                     OpCodeName.Ble_Un => new CilBranchInstruction(GetLabel(nextAddress + (int)operand!)) { Condition = CilBranchCondition.LessThanOrEqualUnsignedUnordered, },
 
                     OpCodeName.Ldfld => new CilLoadFieldInstruction((FieldInfo)operand!),
+                    OpCodeName.Ldflda => new CilLoadFieldAddressInstruction((FieldInfo)operand!),
                     OpCodeName.Ldsfld => new CilLoadStaticFieldInstruction((FieldInfo)operand!),
                     OpCodeName.Stfld => new CilStoreFieldInstruction((FieldInfo)operand!),
                     OpCodeName.Stsfld => new CilStoreStaticFieldInstruction((FieldInfo)operand!),

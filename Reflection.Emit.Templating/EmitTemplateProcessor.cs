@@ -199,6 +199,21 @@ namespace MrHotkeys.Reflection.Emit.Templating
                         break;
                     }
 
+                case CilLoadFieldAddressInstruction ldflda when ldflda.Field.DeclaringType == context.TemplateTargetType:
+                    {
+                        if (ldflda.Field.FieldType == context.CallbackTargetType)
+                            ProcessTargetAccess(context, ref tokens);
+                        else
+                            ProcessLoadFieldAddressFromTarget(context, ref tokens, ldflda, context.Template.Target);
+                        break;
+                    }
+
+                case CilLoadFieldAddressInstruction ldflda when ldflda.Field.DeclaringType == context.CallbackTargetType:
+                    {
+                        ProcessLoadFieldAddressFromTarget(context, ref tokens, ldflda, context.Callback.Target);
+                        break;
+                    }
+
                 case CilCallInstruction call when context.CallbackTargetPropertyGetters.Contains(call.Method):
                     {
                         ProcessCallPropertyGetterOnTarget(context, ref tokens, call, context.Callback.Target);
@@ -659,6 +674,29 @@ namespace MrHotkeys.Reflection.Emit.Templating
             ProcessTargetValue(context, ldfld.Field, value);
         }
 
+        private object? GetLoadFieldAddressFromTargetValue(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilLoadFieldAddressInstruction ldflda, object target)
+        {
+            if (!context.CaptureValues.TryGetValue(ldflda.Field, out var value))
+            {
+                value = ldflda.Field.GetValue(target);
+                context.CaptureValues.Add(ldflda.Field, value);
+            }
+
+            return value;
+        }
+
+        private void ProcessLoadFieldAddressFromTarget(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilLoadFieldAddressInstruction ldflda, object target)
+        {
+            var value = GetLoadFieldAddressFromTargetValue(context, ref tokens, ldflda, target);
+            ProcessTargetValue(context, ldflda.Field, value);
+
+            // We need to store in a local and load that local's address to mimic the ldflda
+            var local = new CilLocalVariable(ldflda.Field.FieldType, "");
+            context.Locals.Add(local);
+            context.Result.Add(new CilStoreLocalInstruction(local));
+            context.Result.Add(new CilLoadLocalAddressInstruction(local));
+        }
+
         private object? GetLoadStaticFieldValue(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilLoadStaticFieldInstruction ldsfld)
         {
             if (!context.CaptureValues.TryGetValue(ldsfld.Field, out var value))
@@ -805,6 +843,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 string s => new CilRawInstruction(OpCodes.Ldstr, s),
                 _ => GetStaticCapture(context, member, value),
             };
+
             context.Result.Add(instruction);
         }
 

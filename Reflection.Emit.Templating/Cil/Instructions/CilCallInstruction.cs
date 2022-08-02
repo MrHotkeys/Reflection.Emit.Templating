@@ -34,11 +34,19 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil.Instructions
 
         public override string ToString()
         {
-            var parameterStrings = Method
-                .GetParameters()
-                .Select(p => $"{p.ParameterType} {p.Name}");
+            try
+            {
+                var parameterStrings = Method
+                    .GetParameters()
+                    .Select(p => $"{p.ParameterType} {p.Name}");
 
-            return $"Call {Method}({string.Join(", ", parameterStrings)})";
+                return $"Call {Method.DeclaringType}.{Method.Name}({string.Join(", ", parameterStrings)})";
+            }
+            catch (NotSupportedException e)
+            {
+                // TODO: Handle better
+                return $"Call {Method.DeclaringType}.{Method.Name}()";
+            }
         }
     }
 }
