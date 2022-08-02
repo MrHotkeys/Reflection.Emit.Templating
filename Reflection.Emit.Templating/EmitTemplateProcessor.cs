@@ -46,7 +46,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
             var template = callback(EmitTemplateSurrogate.Instance);
             var templateBody = CilParser.ParseMethodBody(template.Method);
 
-            var tokens = new Queue<ICilToken>(templateBody.Tokens);
+            var tokens = new ReadOnlyStreamSpan<ICilToken>(templateBody.Tokens.ToArray());
 
             var context = new Context(
                 typeBuilder: typeBuilder,
@@ -55,7 +55,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 argumentIndexOffset: GetArgIndexOffset(template.Method.IsStatic, outIsStatic)
             );
 
-            ProcessTokens(context, tokens);
+            ProcessTokens(context, ref tokens);
 
             templateBody.Tokens = context.Result;
             foreach (var local in context.Locals)
@@ -77,16 +77,16 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 return -1;
         }
 
-        private void ProcessTokens(Context context, Queue<ICilToken> tokens)
+        private void ProcessTokens(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens)
         {
-            while (tokens.Count > 0)
+            while (tokens.Length > 0)
             {
-                var token = tokens.Dequeue();
-                ProcessToken(context, tokens, token);
+                var token = tokens.Take();
+                ProcessToken(context, ref tokens, token);
             }
         }
 
-        private void ProcessToken(Context context, Queue<ICilToken> tokens, ICilToken token)
+        private void ProcessToken(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, ICilToken token)
         {
             switch (token.TokenType)
             {
@@ -101,7 +101,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
                     {
                         if (token is not ICilInstruction instruction)
                             throw new InvalidOperationException();
-                        ProcessInstruction(context, tokens, instruction);
+                        ProcessInstruction(context, ref tokens, instruction);
                         break;
                     }
                 default:
@@ -114,38 +114,27 @@ namespace MrHotkeys.Reflection.Emit.Templating
             context.Result.Add(label);
         }
 
-        private void ProcessInstructions(Context context, Queue<ICilInstruction> instructions)
-        {
-            var tokens = new Queue<ICilToken>(instructions);
-            while (tokens.Count > 0)
-            {
-                var instruction = (ICilInstruction)tokens.Dequeue();
-                ProcessInstruction(context, tokens, instruction);
-            }
-            instructions.Clear();
-        }
-
-        private void ProcessInstruction(Context context, Queue<ICilToken> tokens, ICilInstruction instruction)
+        private void ProcessInstruction(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, ICilInstruction instruction)
         {
             switch (instruction.InstructionType)
             {
                 case CilInstructionType.LoadArgument when !context.Template.Method.IsStatic && instruction is CilLoadArgumentInstruction ldarg && ldarg.Index == 0:
                     {
-                        ProcessTargetAccess(context, tokens);
+                        ProcessTargetAccess(context, ref tokens);
                         break;
                     }
 
                 case CilInstructionType.LoadStaticField when instruction is CilLoadStaticFieldInstruction ldsfld &&
                         (context.CallbackTargetFields.Contains(ldsfld.Field) || context.TemplateTargetFields.Contains(ldsfld.Field)):
                     {
-                        ProcessLoadStaticField(context, tokens, ldsfld);
+                        ProcessLoadStaticField(context, ref tokens, ldsfld);
                         break;
                     }
 
                 case CilInstructionType.Call when instruction is CilCallInstruction call && call.Method.IsStatic &&
                         (context.CallbackTargetPropertyGetters.Contains(call.Method) || context.TemplateTargetPropertyGetters.Contains(call.Method)):
                     {
-                        ProcessCallStaticPropertyGetter(context, tokens, call);
+                        ProcessCallStaticPropertyGetter(context, ref tokens, call);
                         break;
                     }
 
@@ -177,21 +166,20 @@ namespace MrHotkeys.Reflection.Emit.Templating
             }
         }
 
-        private void ProcessTargetAccess(Context context, Queue<ICilToken> tokens)
+        private void ProcessTargetAccess(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens)
         {
-            switch (tokens.Dequeue())
+            switch (tokens.Take())
             {
                 case CilLoadFieldInstruction ldfld when ldfld.Field.FieldType == typeof(EmitTemplateSurrogate):
                     {
-                        var surrogateInstructions = LookAheadToSurrogateMethodCall(tokens);
-                        var call = (CilCallInstruction)surrogateInstructions.Pop();
-                        var argInstructions = GroupArgInstructions(call.Method, surrogateInstructions);
+                        var (surrogateMethod, argsTokenCount) = LookAheadToSurrogateMethodCall(tokens);
+                        var argsTokens = tokens.Slice(0, argsTokenCount);
+                        var argRanges = GetArgSliceInfos(surrogateMethod, argsTokens);
 
-                        // Make sure all instructions we sent in got consumed, shouldn't have any extras since we already found the target for the call (ldfld)
-                        if (surrogateInstructions.Count > 0)
-                            throw new InvalidOperationException();
+                        ProcessSurrogateMethod(context, surrogateMethod, argsTokens, argRanges);
 
-                        ProcessSurrogateMethod(context, (MethodInfo)call.Method, argInstructions);
+                        // Move for every token plus the call at the end
+                        tokens.Move(argsTokenCount + 1);
 
                         break;
                     }
@@ -199,27 +187,27 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 case CilLoadFieldInstruction ldfld when ldfld.Field.DeclaringType == context.TemplateTargetType:
                     {
                         if (ldfld.Field.FieldType == context.CallbackTargetType)
-                            ProcessTargetAccess(context, tokens);
+                            ProcessTargetAccess(context, ref tokens);
                         else
-                            ProcessLoadFieldFromTarget(context, tokens, ldfld, context.Template.Target);
+                            ProcessLoadFieldFromTarget(context, ref tokens, ldfld, context.Template.Target);
                         break;
                     }
 
                 case CilLoadFieldInstruction ldfld when ldfld.Field.DeclaringType == context.CallbackTargetType:
                     {
-                        ProcessLoadFieldFromTarget(context, tokens, ldfld, context.Callback.Target);
+                        ProcessLoadFieldFromTarget(context, ref tokens, ldfld, context.Callback.Target);
                         break;
                     }
 
                 case CilCallInstruction call when context.CallbackTargetPropertyGetters.Contains(call.Method):
                     {
-                        ProcessCallPropertyGetterOnTarget(context, tokens, call, context.Callback.Target);
+                        ProcessCallPropertyGetterOnTarget(context, ref tokens, call, context.Callback.Target);
                         break;
                     }
 
                 case CilCallInstruction call when context.TemplateTargetPropertyGetters.Contains(call.Method):
                     {
-                        ProcessCallPropertyGetterOnTarget(context, tokens, call, context.Template.Target);
+                        ProcessCallPropertyGetterOnTarget(context, ref tokens, call, context.Template.Target);
                         break;
                     }
 
@@ -228,37 +216,38 @@ namespace MrHotkeys.Reflection.Emit.Templating
             }
         }
 
-        private void ProcessSurrogateMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
+        private void ProcessSurrogateMethod(Context context, MethodInfo surrogateMethod, ReadOnlyStreamSpan<ICilToken> argsTokens, Range[] argRanges)
         {
             switch (surrogateMethod.Name)
             {
                 case nameof(EmitTemplateSurrogate.Get):
-                    ProcessSurrogateGetMethod(context, surrogateMethod, argsInstructions);
+                    ProcessSurrogateGetMethod(context, surrogateMethod, argsTokens, argRanges);
                     break;
                 case nameof(EmitTemplateSurrogate.Set):
-                    ProcessSurrogateSetMethod(context, surrogateMethod, argsInstructions);
+                    ProcessSurrogateSetMethod(context, surrogateMethod, argsTokens, argRanges);
                     break;
                 case nameof(EmitTemplateSurrogate.Ref):
-                    ProcessSurrogateRefMethod(context, surrogateMethod, argsInstructions);
+                    ProcessSurrogateRefMethod(context, surrogateMethod, argsTokens, argRanges);
                     break;
                 case nameof(EmitTemplateSurrogate.Call):
-                    ProcessSurrogateCallMethod(context, surrogateMethod, argsInstructions);
+                    ProcessSurrogateCallMethod(context, surrogateMethod, argsTokens, argRanges);
                     break;
                 default:
                     throw new InvalidOperationException();
             }
         }
 
-        private void ProcessSurrogateGetMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
+        private void ProcessSurrogateGetMethod(Context context, MethodInfo surrogateMethod, ReadOnlyStreamSpan<ICilToken> argsTokens, Range[] argRanges)
         {
             var parameters = surrogateMethod.GetParameters();
             if (parameters.Length != 1)
                 throw new InvalidOperationException();
 
-            if (argsInstructions.Count != parameters.Length)
+            if (argRanges.Length != parameters.Length)
                 throw new InvalidOperationException();
 
-            var capture = GetArgValue(context, argsInstructions.Dequeue());
+            var captureSlice = argsTokens.Slice(argRanges[0]);
+            var capture = GetArgValue(context, ref captureSlice);
             if (capture is null)
                 throw new InvalidOperationException();
 
@@ -304,54 +293,55 @@ namespace MrHotkeys.Reflection.Emit.Templating
             context.Result.Add(ldloc);
         }
 
-        private void ProcessSurrogateSetMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
+        private void ProcessSurrogateSetMethod(Context context, MethodInfo surrogateMethod, ReadOnlyStreamSpan<ICilToken> argsTokens, Range[] argRanges)
         {
             var parameters = surrogateMethod.GetParameters();
             if (parameters.Length != 2)
                 throw new InvalidOperationException();
 
-            if (argsInstructions.Count != parameters.Length)
+            if (argRanges.Length != parameters.Length)
                 throw new InvalidOperationException();
 
-            var capture = GetArgValue(context, argsInstructions.Dequeue());
+            var captureSlice = argsTokens.Slice(argRanges[0]);
+            var capture = GetArgValue(context, ref captureSlice);
             if (capture is null)
                 throw new InvalidOperationException();
 
-            var valueInstructions = argsInstructions.Dequeue();
+            var valueSlice = argsTokens.Slice(argRanges[1]);
             var variableType = parameters[0].ParameterType;
             if (variableType == typeof(FieldInfo))
-                ProcessSurrogateSetFieldMethod(context, (FieldInfo)capture, valueInstructions);
+                ProcessSurrogateSetFieldMethod(context, (FieldInfo)capture, ref valueSlice);
             else if (variableType == typeof(PropertyInfo))
-                ProcessSurrogateSetPropertyMethod(context, (PropertyInfo)capture, valueInstructions);
+                ProcessSurrogateSetPropertyMethod(context, (PropertyInfo)capture, ref valueSlice);
             else if (variableType == typeof(LocalVariableInfo))
-                ProcessSurrogateSetLocalMethod(context, (LocalVariableInfo)capture, valueInstructions);
+                ProcessSurrogateSetLocalMethod(context, (LocalVariableInfo)capture, ref valueSlice);
             else
                 throw new InvalidOperationException();
         }
 
-        private void ProcessSurrogateSetFieldMethod(Context context, FieldInfo field, Queue<ICilInstruction> valueInstructions)
+        private void ProcessSurrogateSetFieldMethod(Context context, FieldInfo field, ref ReadOnlyStreamSpan<ICilToken> valueTokens)
         {
             if (!field.IsStatic)
                 context.Result.Add(new CilLoadArgumentInstruction(0));
 
-            ProcessInstructions(context, valueInstructions);
+            ProcessTokens(context, ref valueTokens);
 
             context.Result.Add(new CilStoreFieldInstruction(field));
         }
 
-        private void ProcessSurrogateSetPropertyMethod(Context context, PropertyInfo property, Queue<ICilInstruction> valueInstructions)
+        private void ProcessSurrogateSetPropertyMethod(Context context, PropertyInfo property, ref ReadOnlyStreamSpan<ICilToken> valueTokens)
         {
             if (!property.SetMethod.IsStatic)
                 context.Result.Add(new CilLoadArgumentInstruction(0));
 
-            ProcessInstructions(context, valueInstructions);
+            ProcessTokens(context, ref valueTokens);
 
             context.Result.Add(new CilCallInstruction(property.SetMethod));
         }
 
-        private void ProcessSurrogateSetLocalMethod(Context context, LocalVariableInfo local, Queue<ICilInstruction> valueInstructions)
+        private void ProcessSurrogateSetLocalMethod(Context context, LocalVariableInfo local, ref ReadOnlyStreamSpan<ICilToken> valueTokens)
         {
-            ProcessInstructions(context, valueInstructions);
+            ProcessTokens(context, ref valueTokens);
 
             var stloc = local.LocalIndex switch
             {
@@ -366,16 +356,17 @@ namespace MrHotkeys.Reflection.Emit.Templating
             context.Result.Add(stloc);
         }
 
-        private void ProcessSurrogateRefMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
+        private void ProcessSurrogateRefMethod(Context context, MethodInfo surrogateMethod, ReadOnlyStreamSpan<ICilToken> argsTokens, Range[] argRanges)
         {
             var parameters = surrogateMethod.GetParameters();
             if (parameters.Length != 1)
                 throw new InvalidOperationException();
 
-            if (argsInstructions.Count != parameters.Length)
+            if (argRanges.Length != parameters.Length)
                 throw new InvalidOperationException();
 
-            var capture = GetArgValue(context, argsInstructions.Dequeue());
+            var captureSlice = argsTokens.Slice(argRanges[0]);
+            var capture = GetArgValue(context, ref captureSlice);
             if (capture is null)
                 throw new InvalidOperationException();
 
@@ -405,52 +396,57 @@ namespace MrHotkeys.Reflection.Emit.Templating
             context.Result.Add(ldloca);
         }
 
-        private void ProcessSurrogateCallMethod(Context context, MethodInfo surrogateMethod, Queue<Queue<ICilInstruction>> argsInstructions)
+        private void ProcessSurrogateCallMethod(Context context, MethodInfo surrogateMethod, ReadOnlyStreamSpan<ICilToken> argsTokens, Range[] argRanges)
         {
             var parameters = surrogateMethod.GetParameters();
             if (parameters.Length < 1)
                 throw new InvalidOperationException();
 
-            if (argsInstructions.Count != parameters.Length)
+            if (argRanges.Length != parameters.Length)
                 throw new InvalidOperationException();
+
 
             var methodSourceType = parameters[0].ParameterType;
             if (methodSourceType == typeof(MethodInfo))
             {
-                var method = (MethodInfo)GetArgValue(context, argsInstructions.Dequeue())!;
+                var captureSlice = argsTokens.Slice(argRanges[0]);
+                var method = (MethodInfo?)GetArgValue(context, ref captureSlice);
+                if (method is null)
+                    throw new InvalidOperationException();
 
                 if (!method.IsStatic)
                     context.Result.Add(new CilLoadArgumentInstruction(0));
 
-                ProcessArgsInstructions(context, argsInstructions);
+                ProcessArgsInstructions(context, argsTokens, argRanges.AsSpan().Slice(1));
 
                 context.Result.Add(new CilCallInstruction(method));
             }
             else if (methodSourceType == typeof(Delegate) || methodSourceType.BaseType == typeof(MulticastDelegate))
             {
-                var methodInstructions = new Stack<ICilInstruction>(argsInstructions.Dequeue());
+                var methodSlice = argsTokens.Slice(argRanges[0]);
 
-                if (methodInstructions.Pop() is not CilRawInstruction delegateNew || delegateNew.OpCode != OpCodes.Newobj)
+                if (methodSlice[^1] is not CilRawInstruction delegateNew || delegateNew.OpCode != OpCodes.Newobj)
                     throw new InvalidOperationException();
                 if (delegateNew.Operand is not ConstructorInfo delegateCtor || !typeof(Delegate).IsAssignableFrom(delegateCtor.DeclaringType))
                     throw new InvalidOperationException();
 
-                var ctorInstructions = GroupArgInstructions(delegateCtor, methodInstructions);
+                var delegateCtorArgTokens = methodSlice[..^1];
+                var delegateCtorArgRanges = GetArgSliceInfos(delegateCtor, delegateCtorArgTokens);
 
-                var targetInstructions = ctorInstructions.Dequeue();
-                if (targetInstructions.Peek() is not CilRawInstruction ldnull || ldnull.OpCode != OpCodes.Ldnull)
-                    ProcessInstructions(context, targetInstructions);
+                if (delegateCtorArgRanges.Length != 2)
+                    throw new InvalidOperationException();
 
-                var methodPointerInstructions = ctorInstructions.Dequeue();
-                if (methodPointerInstructions.Dequeue() is not CilRawInstruction ldftn || ldftn.OpCode != OpCodes.Ldftn)
+                var delegateCtorTargetTokens = delegateCtorArgTokens.Slice(delegateCtorArgRanges[0]);
+                if (delegateCtorTargetTokens[0] is not CilRawInstruction ldnull || ldnull.OpCode != OpCodes.Ldnull)
+                    ProcessTokens(context, ref delegateCtorTargetTokens);
+
+                var delegateMethodPointerInstructions = delegateCtorArgTokens.Slice(delegateCtorArgRanges[1]);
+                if (delegateMethodPointerInstructions[0] is not CilRawInstruction ldftn || ldftn.OpCode != OpCodes.Ldftn)
                     throw new InvalidOperationException();
                 if (ldftn.Operand is not MethodBase method)
                     throw new InvalidOperationException();
 
-                if (ctorInstructions.Count > 0)
-                    throw new InvalidOperationException();
-
-                ProcessArgsInstructions(context, argsInstructions);
+                ProcessArgsInstructions(context, argsTokens, argRanges.AsSpan().Slice(1));
 
                 context.Result.Add(new CilCallInstruction(method));
             }
@@ -460,16 +456,16 @@ namespace MrHotkeys.Reflection.Emit.Templating
             }
         }
 
-        private Stack<ICilInstruction> LookAheadToSurrogateMethodCall(Queue<ICilToken> tokens)
+        private (MethodInfo, int) LookAheadToSurrogateMethodCall(ReadOnlyStreamSpan<ICilToken> tokens)
         {
-            var stack = new Stack<ICilInstruction>();
             var depth = 0;
-            while (tokens.Count > 0)
+            var sliceLength = 0;
+            for (var i = 0; i < tokens.Length; i++)
             {
-                if (tokens.Dequeue() is not ICilInstruction instruction)
+                if (tokens[i] is not ICilInstruction instruction)
                     throw new InvalidOperationException();
 
-                stack.Push(instruction);
+                sliceLength++;
 
                 switch (instruction.InstructionType)
                 {
@@ -482,7 +478,12 @@ namespace MrHotkeys.Reflection.Emit.Templating
                     case CilInstructionType.Call when instruction is CilCallInstruction call && call.Method.DeclaringType == typeof(EmitTemplateSurrogate):
                         {
                             if (depth == 0)
-                                return stack;
+                            {
+                                if (call.Method is not MethodInfo method)
+                                    throw new InvalidOperationException();
+
+                                return (method, sliceLength - 1);
+                            }
 
                             depth--;
 
@@ -503,38 +504,42 @@ namespace MrHotkeys.Reflection.Emit.Templating
             throw new InvalidOperationException();
         }
 
-        private Queue<Queue<ICilInstruction>> GroupArgInstructions(MethodBase method, Stack<ICilInstruction> argInstructions)
+        private Range[] GetArgSliceInfos(MethodBase method, ReadOnlyStreamSpan<ICilToken> argsTokens)
         {
             var parameters = method.GetParameters();
 
-            var parameterInstructions = new List<List<ICilInstruction>>(parameters.Length);
-            for (var i = 0; i < parameters.Length; i++)
-                parameterInstructions.Add(new List<ICilInstruction>());
+            var argRanges = new Range[parameters.Length];
+            var argRangesIndex = argRanges.Length - 1; // Fill from right to left
 
-            var parameterIndex = parameters.Length - 1;
             var stack = -1;
-            while (argInstructions.Count > 0)
+            var sliceLength = 0;
+            var tokensScanned = 0;
+            for (var i = argsTokens.Length - 1; i >= 0; i--)
             {
-                if (argInstructions.Pop() is not ICilInstruction instruction)
+                if (argsTokens[i] is not ICilInstruction instruction)
                     throw new InvalidOperationException();
 
-                parameterInstructions[parameterIndex].Add(instruction);
+                tokensScanned++;
+                sliceLength++;
 
                 // TODO: Hack to ignore stloc->ldloc or stloc->ldloca chains confusing the depth search
                 // Ignore a ldloc or ldloca if that local was written to in the instruction immediately previous
-                if (argInstructions.Count != 0 && instruction.InstructionType == CilInstructionType.LoadLocal || instruction.InstructionType == CilInstructionType.LoadLocalAddress)
+                if (i > 0 && instruction.InstructionType == CilInstructionType.LoadLocal || instruction.InstructionType == CilInstructionType.LoadLocalAddress)
                 {
                     if (instruction is not IHasLocalOperand hasLocal)
                         throw new InvalidOperationException();
 
-                    if (argInstructions.Peek() is ICilInstruction peek && peek.InstructionType == CilInstructionType.StoreLocal)
+                    if (argsTokens[i - 1] is ICilInstruction peek && peek.InstructionType == CilInstructionType.StoreLocal)
                     {
                         if (peek is not CilStoreLocalInstruction stloc)
                             throw new InvalidOperationException();
 
                         if (hasLocal.Local == stloc.Local)
                         {
-                            parameterInstructions[parameterIndex].Add(argInstructions.Pop());
+                            // Skip rest of this instruction and next
+                            tokensScanned++;
+                            sliceLength++;
+                            i--;
                             continue;
                         }
                     }
@@ -550,24 +555,25 @@ namespace MrHotkeys.Reflection.Emit.Templating
 
                 if (stack == 0)
                 {
-                    parameterIndex--;
-                    stack = -1;
+                    // We have found a complete argument
+                    argRanges[argRangesIndex] = new Range(i, i + sliceLength);
 
-                    if (parameterIndex < 0)
+                    stack = -1;
+                    sliceLength = 0;
+                    argRangesIndex--;
+
+                    if (argRangesIndex < 0)
                         break;
                 }
             }
 
-            if (parameterIndex >= 0)
+            if (argRangesIndex >= 0)
                 throw new InvalidOperationException();
 
-            var result = parameterInstructions
-                .Select(i => i
-                    .AsEnumerable()
-                    .Reverse())
-                .Select(i => new Queue<ICilInstruction>(i));
+            if (tokensScanned != argsTokens.Length)
+                throw new InvalidOperationException();
 
-            return new Queue<Queue<ICilInstruction>>(result);
+            return argRanges;
         }
 
         private int GetPopOffset(ICilInstruction instruction)
@@ -636,8 +642,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
             return false;
         }
 
-        private object? GetLoadFieldFromTargetValue<T>(Context context, Queue<T> tokens, CilLoadFieldInstruction ldfld, object target)
-            where T : ICilToken
+        private object? GetLoadFieldFromTargetValue(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilLoadFieldInstruction ldfld, object target)
         {
             if (!context.CaptureValues.TryGetValue(ldfld.Field, out var value))
             {
@@ -648,15 +653,13 @@ namespace MrHotkeys.Reflection.Emit.Templating
             return value;
         }
 
-        private void ProcessLoadFieldFromTarget<T>(Context context, Queue<T> tokens, CilLoadFieldInstruction ldfld, object target)
-            where T : ICilToken
+        private void ProcessLoadFieldFromTarget(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilLoadFieldInstruction ldfld, object target)
         {
-            var value = GetLoadFieldFromTargetValue(context, tokens, ldfld, target);
+            var value = GetLoadFieldFromTargetValue(context, ref tokens, ldfld, target);
             ProcessTargetValue(context, ldfld.Field, value);
         }
 
-        private object? GetLoadStaticFieldValue<T>(Context context, Queue<T> tokens, CilLoadStaticFieldInstruction ldsfld)
-            where T : ICilToken
+        private object? GetLoadStaticFieldValue(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilLoadStaticFieldInstruction ldsfld)
         {
             if (!context.CaptureValues.TryGetValue(ldsfld.Field, out var value))
             {
@@ -667,22 +670,19 @@ namespace MrHotkeys.Reflection.Emit.Templating
             return value;
         }
 
-        private void ProcessLoadStaticField<T>(Context context, Queue<T> tokens, CilLoadStaticFieldInstruction ldsfld)
-            where T : ICilToken
+        private void ProcessLoadStaticField(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilLoadStaticFieldInstruction ldsfld)
         {
-            var value = GetLoadStaticFieldValue(context, tokens, ldsfld);
+            var value = GetLoadStaticFieldValue(context, ref tokens, ldsfld);
             ProcessTargetValue(context, ldsfld.Field, value);
         }
 
-        private void ProcessCallStaticPropertyGetter<T>(Context context, Queue<T> tokens, CilCallInstruction call)
-            where T : ICilToken
+        private void ProcessCallStaticPropertyGetter(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilCallInstruction call)
         {
-            var value = GetCallStaticPropertyGetterValue(context, tokens, call);
+            var value = GetCallStaticPropertyGetterValue(context, ref tokens, call);
             ProcessTargetValue(context, call.Method, value);
         }
 
-        private object? GetCallStaticPropertyGetterValue<T>(Context context, Queue<T> tokens, CilCallInstruction call)
-            where T : ICilToken
+        private object? GetCallStaticPropertyGetterValue(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilCallInstruction call)
         {
             if (!context.CaptureValues.TryGetValue(call.Method, out var value))
             {
@@ -696,8 +696,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
             return value;
         }
 
-        private object? GetCallPropertyGetterOnTargetValue<T>(Context context, Queue<T> tokens, CilCallInstruction call, object target)
-            where T : ICilToken
+        private object? GetCallPropertyGetterOnTargetValue(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilCallInstruction call, object target)
         {
             if (!context.CaptureValues.TryGetValue(call.Method, out var value))
             {
@@ -711,69 +710,77 @@ namespace MrHotkeys.Reflection.Emit.Templating
             return value;
         }
 
-        private void ProcessCallPropertyGetterOnTarget<T>(Context context, Queue<T> tokens, CilCallInstruction call, object target)
-            where T : ICilToken
+        private void ProcessCallPropertyGetterOnTarget(Context context, ref ReadOnlyStreamSpan<ICilToken> tokens, CilCallInstruction call, object target)
         {
-            var value = GetCallPropertyGetterOnTargetValue(context, tokens, call, target);
+            var value = GetCallPropertyGetterOnTargetValue(context, ref tokens, call, target);
             ProcessTargetValue(context, call.Method, value);
         }
 
-        private object? GetArgValue(Context context, Queue<ICilInstruction> argInstructions)
+        private object? GetArgValue(Context context, ref ReadOnlyStreamSpan<ICilToken> argTokens)
         {
-            if (argInstructions.Dequeue() is CilLoadArgumentInstruction ldarg)
+            if (argTokens.Take() is not ICilInstruction instruction)
+                throw new InvalidOperationException();
+
+            if (instruction is CilLoadArgumentInstruction ldarg)
             {
                 if (ldarg.Index != 0)
                     throw new InvalidOperationException();
 
-                return GetArgValueFromTarget(context, argInstructions);
+                return GetArgValueFromTarget(context, ref argTokens);
             }
             else
             {
-                return GetArgValueFromStatic(context, argInstructions);
+                return GetArgValueFromStatic(context, ref argTokens);
             }
         }
 
-        private object? GetArgValueFromTarget(Context context, Queue<ICilInstruction> argInstructions)
+        private object? GetArgValueFromTarget(Context context, ref ReadOnlyStreamSpan<ICilToken> argTokens)
         {
-            var value = argInstructions.Dequeue() switch
+            if (argTokens.Take() is not ICilInstruction instruction)
+                throw new InvalidOperationException();
+
+            var value = instruction switch
             {
                 CilLoadFieldInstruction ldfld when ldfld.Field.DeclaringType == context.TemplateTargetType =>
                     ldfld.Field.FieldType == context.CallbackTargetType ?
-                    GetArgValueFromTarget(context, argInstructions) :
-                    GetLoadFieldFromTargetValue(context, argInstructions, ldfld, context.Template.Target),
+                    GetArgValueFromTarget(context, ref argTokens) :
+                    GetLoadFieldFromTargetValue(context, ref argTokens, ldfld, context.Template.Target),
 
                 CilLoadFieldInstruction ldfld when ldfld.Field.DeclaringType == context.CallbackTargetType =>
-                    GetLoadFieldFromTargetValue(context, argInstructions, ldfld, context.Callback.Target),
+                    GetLoadFieldFromTargetValue(context, ref argTokens, ldfld, context.Callback.Target),
 
                 CilCallInstruction call when context.CallbackTargetPropertyGetters.Contains(call.Method) =>
-                    GetCallPropertyGetterOnTargetValue(context, argInstructions, call, context.Callback.Target),
+                    GetCallPropertyGetterOnTargetValue(context, ref argTokens, call, context.Callback.Target),
 
                 CilCallInstruction call when context.TemplateTargetPropertyGetters.Contains(call.Method) =>
-                    GetCallPropertyGetterOnTargetValue(context, argInstructions, call, context.Template.Target),
+                    GetCallPropertyGetterOnTargetValue(context, ref argTokens, call, context.Template.Target),
 
                 _ => throw new InvalidOperationException(),
             };
 
-            if (argInstructions.Count > 0)
+            if (argTokens.Length > 0)
                 throw new InvalidOperationException();
 
             return value;
         }
 
-        private object? GetArgValueFromStatic(Context context, Queue<ICilInstruction> argInstructions)
+        private object? GetArgValueFromStatic(Context context, ref ReadOnlyStreamSpan<ICilToken> argTokens)
         {
-            var value = argInstructions.Dequeue() switch
+            if (argTokens.Take() is not ICilInstruction instruction)
+                throw new InvalidOperationException();
+
+            var value = instruction switch
             {
                 CilLoadStaticFieldInstruction ldsfld when context.CallbackTargetFields.Contains(ldsfld.Field) || context.TemplateTargetFields.Contains(ldsfld.Field) =>
-                    GetLoadStaticFieldValue(context, argInstructions, ldsfld),
+                    GetLoadStaticFieldValue(context, ref argTokens, ldsfld),
 
                 CilCallInstruction call when context.CallbackTargetPropertyGetters.Contains(call.Method) || context.TemplateTargetPropertyGetters.Contains(call.Method) =>
-                    GetCallStaticPropertyGetterValue(context, argInstructions, call),
+                    GetCallStaticPropertyGetterValue(context, ref argTokens, call),
 
                 _ => throw new InvalidOperationException(),
             };
 
-            if (argInstructions.Count > 0)
+            if (argTokens.Length > 0)
                 throw new InvalidOperationException();
 
             return value;
@@ -867,10 +874,13 @@ namespace MrHotkeys.Reflection.Emit.Templating
             return new CilCallInstruction(propertyBuilder.GetMethod);
         }
 
-        private void ProcessArgsInstructions(Context context, Queue<Queue<ICilInstruction>> argsInstructions)
+        private void ProcessArgsInstructions(Context context, ReadOnlyStreamSpan<ICilToken> tokens, Span<Range> argRanges)
         {
-            foreach (var queue in argsInstructions)
-                ProcessInstructions(context, queue);
+            foreach (var argRange in argRanges)
+            {
+                var argTokens = tokens.Slice(argRange);
+                ProcessTokens(context, ref argTokens);
+            }
         }
 
         private sealed class Context

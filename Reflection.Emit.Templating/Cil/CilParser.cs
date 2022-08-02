@@ -30,9 +30,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
         public ICilMethodBody ParseMethodBody(MethodInfo method)
         {
             var body = method.GetMethodBody();
-            var bytes = (ReadOnlySpan<byte>)body
-                .GetILAsByteArray()
-                .AsSpan();
+            var bytes = new ReadOnlyStreamSpan<byte>(body.GetILAsByteArray());
 
             var localCounter = 0;
             var locals = body
@@ -155,41 +153,34 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
             return new CilMethodBody(locals, tokens);
         }
 
-        public OpCode ParseOpCode(ref ReadOnlySpan<byte> bytes)
+        private OpCode ParseOpCode(ref ReadOnlyStreamSpan<byte> bytes)
         {
-            var key = (short)bytes[0];
-            if (key != 0xFE)
-            {
-                bytes = bytes.Slice(1);
-            }
-            else
-            {
-                key = unchecked((short)((key << 8) + bytes[1]));
-                bytes = bytes.Slice(2);
-            }
+            var key = bytes[0] != 0xFE ?
+                bytes.Take<byte>() :
+                bytes.Take<short>(false);
 
             return OpCodeLookup.TryGetValue(key, out var opCode) ?
                 opCode :
                 throw new InvalidOperationException();
         }
 
-        public object? ParseOperand(OpCode opCode, ref ReadOnlySpan<byte> bytes, Module module)
+        private object? ParseOperand(OpCode opCode, ref ReadOnlyStreamSpan<byte> bytes, Module module)
         {
             return opCode.OperandType switch
             {
                 OperandType.InlineNone => null,
 
-                OperandType.ShortInlineI when (OpCodeName)opCode.Value == OpCodeName.Ldc_I4_S => (object?)ParseOperandSByte(ref bytes),
+                OperandType.ShortInlineI when (OpCodeName)opCode.Value == OpCodeName.Ldc_I4_S => (object?)bytes.Take<sbyte>(),
 
-                OperandType.ShortInlineI => ParseOperandByte(ref bytes),
-                OperandType.InlineI => ParseOperandInt(ref bytes),
-                OperandType.InlineI8 => ParseOperandLong(ref bytes),
+                OperandType.ShortInlineI => bytes.Take<byte>(),
+                OperandType.InlineI => bytes.Take<int>(),
+                OperandType.InlineI8 => bytes.Take<long>(),
 
-                OperandType.ShortInlineR => ParseOperandFloat(ref bytes),
-                OperandType.InlineR => ParseOperandDouble(ref bytes),
+                OperandType.ShortInlineR => bytes.Take<float>(),
+                OperandType.InlineR => bytes.Take<double>(),
 
-                OperandType.ShortInlineBrTarget => ParseOperandSByte(ref bytes),
-                OperandType.InlineBrTarget => ParseOperandInt(ref bytes),
+                OperandType.ShortInlineBrTarget => bytes.Take<sbyte>(),
+                OperandType.InlineBrTarget => bytes.Take<int>(),
 
                 OperandType.InlineString => ParseOperandString(ref bytes, module),
 
@@ -198,10 +189,10 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                 OperandType.InlineMethod => ParseOperandMethod(ref bytes, module),
                 OperandType.InlineSig => ParseOperandSignature(ref bytes, module),
 
-                OperandType.ShortInlineVar => ParseOperandByte(ref bytes),
-                OperandType.InlineVar => ParseOperandUShort(ref bytes),
+                OperandType.ShortInlineVar => bytes.Take<byte>(),
+                OperandType.InlineVar => bytes.Take<ushort>(),
 
-                OperandType.InlineSwitch => ParseOperandUInt(ref bytes),
+                OperandType.InlineSwitch => bytes.Take<uint>(),
 
                 OperandType.InlineTok => ParseOperandMetadataToken(ref bytes, module),
 
@@ -211,100 +202,45 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
             };
         }
 
-        public byte ParseOperandByte(ref ReadOnlySpan<byte> bytes)
+        private string ParseOperandString(ref ReadOnlyStreamSpan<byte> bytes, Module module)
         {
-            var value = bytes[0];
-            bytes = bytes.Slice(sizeof(byte));
-            return value;
-        }
-
-        public sbyte ParseOperandSByte(ref ReadOnlySpan<byte> bytes)
-        {
-            var value = unchecked((sbyte)bytes[0]);
-            bytes = bytes.Slice(sizeof(sbyte));
-            return value;
-        }
-
-        public ushort ParseOperandUShort(ref ReadOnlySpan<byte> bytes)
-        {
-            var value = BitConverter.ToUInt16(bytes);
-            bytes = bytes.Slice(sizeof(ushort));
-            return value;
-        }
-
-        public int ParseOperandInt(ref ReadOnlySpan<byte> bytes)
-        {
-            var value = BitConverter.ToInt32(bytes);
-            bytes = bytes.Slice(sizeof(int));
-            return value;
-        }
-
-        public uint ParseOperandUInt(ref ReadOnlySpan<byte> bytes)
-        {
-            var value = BitConverter.ToUInt32(bytes);
-            bytes = bytes.Slice(sizeof(uint));
-            return value;
-        }
-
-        public long ParseOperandLong(ref ReadOnlySpan<byte> bytes)
-        {
-            var value = BitConverter.ToInt64(bytes);
-            bytes = bytes.Slice(sizeof(long));
-            return value;
-        }
-
-        public float ParseOperandFloat(ref ReadOnlySpan<byte> bytes)
-        {
-            var value = BitConverter.ToSingle(bytes);
-            bytes = bytes.Slice(sizeof(float));
-            return value;
-        }
-
-        public double ParseOperandDouble(ref ReadOnlySpan<byte> bytes)
-        {
-            var value = BitConverter.ToDouble(bytes);
-            bytes = bytes.Slice(sizeof(double));
-            return value;
-        }
-
-        public string ParseOperandString(ref ReadOnlySpan<byte> bytes, Module module)
-        {
-            var token = ParseOperandInt(ref bytes);
+            var token = bytes.Take<int>();
             return module.ResolveString(token);
         }
 
-        public Type ParseOperandType(ref ReadOnlySpan<byte> bytes, Module module)
+        private Type ParseOperandType(ref ReadOnlyStreamSpan<byte> bytes, Module module)
         {
-            var token = ParseOperandInt(ref bytes);
+            var token = bytes.Take<int>();
             return module.ResolveType(token);
         }
 
-        public FieldInfo ParseOperandField(ref ReadOnlySpan<byte> bytes, Module module)
+        private FieldInfo ParseOperandField(ref ReadOnlyStreamSpan<byte> bytes, Module module)
         {
-            var token = ParseOperandInt(ref bytes);
+            var token = bytes.Take<int>();
             return module.ResolveField(token);
         }
 
-        public MethodBase ParseOperandMethod(ref ReadOnlySpan<byte> bytes, Module module)
+        private MethodBase ParseOperandMethod(ref ReadOnlyStreamSpan<byte> bytes, Module module)
         {
-            var token = ParseOperandInt(ref bytes);
+            var token = bytes.Take<int>();
             return module.ResolveMethod(token);
         }
 
-        public byte[] ParseOperandSignature(ref ReadOnlySpan<byte> bytes, Module module)
+        private byte[] ParseOperandSignature(ref ReadOnlyStreamSpan<byte> bytes, Module module)
         {
-            Logger.LogWarning($"Resolving signature as {typeof(byte[]).Name} - writing  is unsupported unless converted to {nameof(SignatureHelper)}!");
-            var token = ParseOperandInt(ref bytes);
+            Logger.LogWarning($"Resolving signature as {typeof(byte[]).Name} at position {bytes.Position} - writing  is unsupported unless converted to {nameof(SignatureHelper)}!");
+
+            var token = bytes.Take<int>();
             return module.ResolveSignature(token);
         }
 
-        public MemberInfo ParseOperandMember(ref ReadOnlySpan<byte> bytes, Module module)
+        private MemberInfo ParseOperandMember(ref ReadOnlyStreamSpan<byte> bytes, Module module)
         {
-            var token = ParseOperandInt(ref bytes);
+            var token = bytes.Take<int>();
             return module.ResolveMember(token);
         }
 
-        public object ParseOperandMetadataToken(ref ReadOnlySpan<byte> bytes, Module module)
+        private object ParseOperandMetadataToken(ref ReadOnlyStreamSpan<byte> bytes, Module module)
         {
             // Most significant byte of token defines type
             var mostSignificantByteIndex = BitConverter.IsLittleEndian ? 3 : 0;
