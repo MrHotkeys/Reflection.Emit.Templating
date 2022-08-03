@@ -12,6 +12,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
         LoadField,
         LoadFieldAddress,
         LoadStaticField,
+        LoadStaticFieldAddress,
         StoreField,
         StoreStaticField,
         Call,

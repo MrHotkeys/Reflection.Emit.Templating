@@ -53,7 +53,6 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 typeBuilder: typeBuilder,
                 callback: callback,
                 template: template,
-                defineTargetStaticCaptureCallback: DefineTargetStaticCapture,
                 argumentIndexOffset: GetArgIndexOffset(template.Method.IsStatic, outIsStatic)
             );
 
@@ -66,82 +65,13 @@ namespace MrHotkeys.Reflection.Emit.Templating
             if (templateBody.Tokens[^1] is ICilInstruction lastInstruction && lastInstruction.InstructionType == CilInstructionType.Return)
                 templateBody.Tokens.RemoveAt(templateBody.Tokens.Count - 1);
 
+            // Check if any of the captures were access and slip in a call to init them if so
+            if (context.InitCallbackTargetStaticCapture is not null)
+                templateBody.Tokens.Insert(0, new CilCallInstruction(context.InitCallbackTargetStaticCapture));
+            if (context.InitTemplateTargetStaticCapture is not null)
+                templateBody.Tokens.Insert(0, new CilCallInstruction(context.InitTemplateTargetStaticCapture));
+
             CilWriter.Write(il, templateBody);
-        }
-
-        private PropertyBuilder DefineTargetStaticCapture(TypeBuilder typeBuilder, object target)
-        {
-            var type = target.GetType();
-            var propertyName = $"{type.Name}_Capture";
-            var staticCapturesKey = $"({Guid.NewGuid()}) {propertyName}";
-
-            var backingFieldBuilder = typeBuilder.DefineAutoPropertyBackingField(
-                propertyName: propertyName,
-                type: type,
-                attributes: FieldAttributes.Private | FieldAttributes.Static);
-
-            // Used to keep track of whether the code has run to pull the value for this capture from the static capture dictionary
-            var claimedBuilder = typeBuilder.DefineField(
-                fieldName: $"<{propertyName}>k__Claimed",
-                type: typeof(bool),
-                attributes: FieldAttributes.Private | FieldAttributes.Static
-            );
-
-            var propertyBuilder = typeBuilder.DefineProperty(
-                name: propertyName,
-                attributes: PropertyAttributes.None,
-                callingConvention: CallingConventions.Standard,
-                returnType: type,
-                parameterTypes: Array.Empty<Type>()
-            );
-
-            var getterBuilder = typeBuilder.DefineMethod(
-                name: $"get_{propertyName}",
-                attributes: MethodAttributes.Private | MethodAttributes.Static,
-                callingConvention: CallingConventions.Standard,
-                returnType: type,
-                parameterTypes: Array.Empty<Type>()
-            );
-
-            var il = getterBuilder.GetILGenerator();
-
-            var returnLabel = il.DefineLabel();
-            il.Emit(OpCodes.Ldsfld, claimedBuilder);
-            il.Emit(OpCodes.Brtrue, returnLabel);
-
-            il.Emit(OpCodes.Ldstr, staticCapturesKey);
-            il.Emit(OpCodes.Call, typeof(EmitTemplateProcessor).GetMethod(nameof(GetStaticCapture)));
-            if (type.IsValueType)
-                il.Emit(OpCodes.Unbox_Any, type);
-            il.Emit(OpCodes.Stsfld, backingFieldBuilder);
-            il.Emit(OpCodes.Ldc_I4_1);
-            il.Emit(OpCodes.Stsfld, claimedBuilder);
-
-            il.MarkLabel(returnLabel);
-            il.Emit(OpCodes.Ldsfld, backingFieldBuilder);
-            il.Emit(OpCodes.Ret);
-
-            propertyBuilder.SetGetMethod(getterBuilder);
-
-            lock (StaticCapturesLock)
-            {
-                StaticCaptures.Add(staticCapturesKey, target);
-            }
-
-            // Add the attribute to be able to see private members in the target's assembly if it hasn't already been added
-            var assemblyBuilder = (AssemblyBuilder)typeBuilder.Assembly;
-            var assemblyName = type.Assembly.GetName().Name;
-            if (assemblyBuilder.GetCustomAttributesData().All(d => d.AttributeType != typeof(IgnoresAccessChecksToAttribute) || (string)d.ConstructorArguments[0].Value != assemblyName))
-            {
-                var attributeBuilder = new CustomAttributeBuilder(
-                    con: typeof(IgnoresAccessChecksToAttribute).GetConstructors().Single(),
-                    constructorArgs: new object[] { assemblyName }
-                );
-
-                assemblyBuilder.SetCustomAttribute(attributeBuilder);
-            }
-
-            return propertyBuilder;
         }
 
         private int GetArgIndexOffset(bool templateIsStatic, bool destinationIsStatic)
@@ -234,9 +164,19 @@ namespace MrHotkeys.Reflection.Emit.Templating
             else
             {
                 if (context.TemplateTargetStaticCapture is not null)
-                    context.Result.Add(new CilCallInstruction(context.TemplateTargetStaticCapture.GetMethod));
+                {
+                    if (context.TemplateTargetStaticCapture.FieldType.IsValueType)
+                        context.Result.Add(new CilLoadStaticFieldAddressInstruction(context.TemplateTargetStaticCapture));
+                    else
+                        context.Result.Add(new CilLoadStaticFieldInstruction(context.TemplateTargetStaticCapture));
+                }
                 else if (context.CallbackTargetStaticCapture is not null)
-                    context.Result.Add(new CilCallInstruction(context.CallbackTargetStaticCapture.GetMethod));
+                {
+                    if (context.CallbackTargetStaticCapture.FieldType.IsValueType)
+                        context.Result.Add(new CilLoadStaticFieldAddressInstruction(context.CallbackTargetStaticCapture));
+                    else
+                        context.Result.Add(new CilLoadStaticFieldInstruction(context.CallbackTargetStaticCapture));
+                }
                 else
                     throw new InvalidOperationException();
             }
@@ -820,8 +760,9 @@ namespace MrHotkeys.Reflection.Emit.Templating
 
             public HashSet<MethodInfo> CallbackTargetPropertyGetters { get; }
 
-            private Lazy<PropertyBuilder?> _callbackTargetStaticCapture;
-            public PropertyBuilder? CallbackTargetStaticCapture => _callbackTargetStaticCapture.Value;
+            private Lazy<FieldInfo?> _callbackTargetStaticCapture;
+            public FieldInfo? CallbackTargetStaticCapture => _callbackTargetStaticCapture.Value;
+            public MethodInfo? InitCallbackTargetStaticCapture { get; private set; }
 
             public Delegate Template { get; }
 
@@ -831,8 +772,9 @@ namespace MrHotkeys.Reflection.Emit.Templating
 
             public HashSet<MethodInfo> TemplateTargetPropertyGetters { get; }
 
-            private Lazy<PropertyBuilder?> _templateTargetStaticCapture;
-            public PropertyBuilder? TemplateTargetStaticCapture => _templateTargetStaticCapture.Value;
+            private Lazy<FieldInfo?> _templateTargetStaticCapture;
+            public FieldInfo? TemplateTargetStaticCapture => _templateTargetStaticCapture.Value;
+            public MethodInfo? InitTemplateTargetStaticCapture { get; private set; }
 
             public int ArugmentIndexOffset { get; }
 
@@ -846,7 +788,7 @@ namespace MrHotkeys.Reflection.Emit.Templating
 
             public Guid Guid { get; } = Guid.NewGuid();
 
-            public Context(TypeBuilder typeBuilder, Delegate callback, Delegate template, Func<TypeBuilder, object, PropertyBuilder> defineTargetStaticCaptureCallback, int argumentIndexOffset)
+            public Context(TypeBuilder typeBuilder, Delegate callback, Delegate template, int argumentIndexOffset)
             {
                 TypeBuilder = typeBuilder ?? throw new ArgumentNullException(nameof(typeBuilder));
                 Callback = callback ?? throw new ArgumentNullException(nameof(callback));
@@ -854,21 +796,25 @@ namespace MrHotkeys.Reflection.Emit.Templating
                 ArugmentIndexOffset = argumentIndexOffset;
 
                 // Use Lazy instances and a callback so we're not capturing objects that aren't used
-                if (defineTargetStaticCaptureCallback is null)
-                    throw new ArgumentNullException(nameof(defineTargetStaticCaptureCallback));
-                _callbackTargetStaticCapture = new Lazy<PropertyBuilder?>(() =>
+                _callbackTargetStaticCapture = new Lazy<FieldInfo?>(() =>
                 {
                     var target = Callback.Target;
-                    return target is not null ?
-                        defineTargetStaticCaptureCallback(TypeBuilder, target) :
-                        null;
+                    if (target is null)
+                        return null;
+
+                    var field = DefineTargetStaticCapture(TypeBuilder, target, out var init);
+                    InitCallbackTargetStaticCapture = init;
+                    return field;
                 });
-                _templateTargetStaticCapture = new Lazy<PropertyBuilder?>(() =>
+                _templateTargetStaticCapture = new Lazy<FieldInfo?>(() =>
                 {
                     var target = Template.Target;
-                    return target is not null ?
-                        defineTargetStaticCaptureCallback(TypeBuilder, target) :
-                        null;
+                    if (target is null)
+                        return null;
+
+                    var field = DefineTargetStaticCapture(TypeBuilder, target, out var init);
+                    InitTemplateTargetStaticCapture = init;
+                    return field;
                 });
 
                 const BindingFlags Flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
@@ -894,6 +840,70 @@ namespace MrHotkeys.Reflection.Emit.Templating
                     .Select(p => p.GetMethod)
                     .ToHashSet()
                     ?? new HashSet<MethodInfo>();
+            }
+
+            private FieldBuilder DefineTargetStaticCapture(TypeBuilder typeBuilder, object target, out MethodBuilder initBuilder)
+            {
+                var type = target.GetType();
+                var fieldName = $"{type.Name}_Capture";
+                var staticCapturesKey = $"({Guid.NewGuid()}) {fieldName}";
+
+                var fieldBuilder = typeBuilder.DefineField(
+                    fieldName: fieldName,
+                    type: type,
+                    attributes: FieldAttributes.Private | FieldAttributes.Static
+                );
+
+                var claimedBuilder = typeBuilder.DefineField(
+                    fieldName: $"{fieldName}_claimed",
+                    type: typeof(bool),
+                    attributes: FieldAttributes.Private | FieldAttributes.Static
+                );
+
+                initBuilder = typeBuilder.DefineMethod(
+                    name: $"init_{fieldName}",
+                    attributes: MethodAttributes.Private | MethodAttributes.Static,
+                    callingConvention: CallingConventions.Standard,
+                    returnType: null,
+                    parameterTypes: Array.Empty<Type>()
+                );
+
+                var il = initBuilder.GetILGenerator();
+
+                var returnLabel = il.DefineLabel();
+                il.Emit(OpCodes.Ldsfld, claimedBuilder);
+                il.Emit(OpCodes.Brtrue, returnLabel);
+
+                il.Emit(OpCodes.Ldstr, staticCapturesKey);
+                il.Emit(OpCodes.Call, typeof(EmitTemplateProcessor).GetMethod(nameof(GetStaticCapture)));
+                if (type.IsValueType)
+                    il.Emit(OpCodes.Unbox_Any, type);
+                il.Emit(OpCodes.Stsfld, fieldBuilder);
+                il.Emit(OpCodes.Ldc_I4_1);
+                il.Emit(OpCodes.Stsfld, claimedBuilder);
+
+                il.MarkLabel(returnLabel);
+                il.Emit(OpCodes.Ret);
+
+                lock (StaticCapturesLock)
+                {
+                    StaticCaptures.Add(staticCapturesKey, target);
+                }
+
+                // Add the attribute to be able to see private members in the target's assembly if it hasn't already been added
+                var assemblyBuilder = (AssemblyBuilder)typeBuilder.Assembly;
+                var assemblyName = type.Assembly.GetName().Name;
+                if (assemblyBuilder.GetCustomAttributesData().All(d => d.AttributeType != typeof(IgnoresAccessChecksToAttribute) || (string)d.ConstructorArguments[0].Value != assemblyName))
+                {
+                    var attributeBuilder = new CustomAttributeBuilder(
+                        con: typeof(IgnoresAccessChecksToAttribute).GetConstructors().Single(),
+                        constructorArgs: new object[] { assemblyName }
+                    );
+
+                    assemblyBuilder.SetCustomAttribute(attributeBuilder);
+                }
+
+                return fieldBuilder;
             }
         }
     }

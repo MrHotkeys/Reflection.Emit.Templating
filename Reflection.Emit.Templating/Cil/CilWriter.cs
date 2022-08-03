@@ -163,6 +163,13 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                         WriteLoadStaticFieldInstruction(il, context, ldsfld);
                         break;
                     }
+                case CilInstructionType.LoadStaticFieldAddress:
+                    {
+                        if (instruction is not CilLoadStaticFieldAddressInstruction ldsflda)
+                            throw new InvalidOperationException();
+                        WriteLoadStaticFieldAddressInstruction(il, context, ldsflda);
+                        break;
+                    }
                 case CilInstructionType.StoreField:
                     {
                         if (instruction is not CilStoreFieldInstruction stfld)
@@ -361,6 +368,11 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
         private void WriteLoadStaticFieldInstruction(ILGenerator il, Context context, CilLoadStaticFieldInstruction ldsfld)
         {
             EmitAndLog(il, OpCodes.Ldsfld, ldsfld.Field);
+        }
+
+        private void WriteLoadStaticFieldAddressInstruction(ILGenerator il, Context context, CilLoadStaticFieldAddressInstruction ldsflda)
+        {
+            EmitAndLog(il, OpCodes.Ldsflda, ldsflda.Field);
         }
 
         private void WriteStoreFieldInstruction(ILGenerator il, Context context, CilStoreFieldInstruction stfld)

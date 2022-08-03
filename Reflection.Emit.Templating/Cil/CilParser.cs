@@ -125,6 +125,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                     OpCodeName.Ldfld => new CilLoadFieldInstruction((FieldInfo)operand!),
                     OpCodeName.Ldflda => new CilLoadFieldAddressInstruction((FieldInfo)operand!),
                     OpCodeName.Ldsfld => new CilLoadStaticFieldInstruction((FieldInfo)operand!),
+                    OpCodeName.Ldsflda => new CilLoadStaticFieldAddressInstruction((FieldInfo)operand!),
                     OpCodeName.Stfld => new CilStoreFieldInstruction((FieldInfo)operand!),
                     OpCodeName.Stsfld => new CilStoreStaticFieldInstruction((FieldInfo)operand!),
 
