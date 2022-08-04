@@ -454,7 +454,19 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                     break;
 
                 case OperandType.InlineSwitch:
-                    EmitAndLog(il, opCode, (uint)raw.Operand!);
+                    {
+                        var labels = (ICilLabel[])raw.Operand!;
+                        var emittedLabels = new Label[labels.Length];
+                        for (var i = 0; i < labels.Length; i++)
+                        {
+                            if (!context.Labels.TryGetValue(labels[i], out var emittedLabel))
+                                throw new InvalidOperationException();
+
+                            emittedLabels[i] = emittedLabel;
+                        }
+
+                        EmitAndLog(il, opCode, emittedLabels, labels);
+                    }
                     break;
 
                 case OperandType.InlineTok:
@@ -548,6 +560,13 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
         {
             if (EmitLogLevel.HasValue && Logger.IsEnabled(EmitLogLevel.Value))
                 Logger.Log(EmitLogLevel.Value, $"{opCode.Name} {label.Name}");
+            il.Emit(opCode, operand);
+        }
+
+        private void EmitAndLog(ILGenerator il, OpCode opCode, Label[] operand, ICilLabel[] labels)
+        {
+            if (EmitLogLevel.HasValue && Logger.IsEnabled(EmitLogLevel.Value))
+                Logger.Log(EmitLogLevel.Value, $"{opCode.Name} {string.Join(",", labels.Select(l => l.Name))}");
             il.Emit(opCode, operand);
         }
 

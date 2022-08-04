@@ -138,6 +138,8 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                     OpCodeName.Call or
                     OpCodeName.Callvirt => new CilCallInstruction((MethodBase)operand!),
 
+                    OpCodeName.Switch => new CilRawInstruction(OpCodes.Switch, ((int[])operand!).Select(i => GetLabel(nextAddress + i)).ToArray()),
+
                     OpCodeName.Ret => new CilReturnInstruction(),
 
                     _ => new CilRawInstruction(opCode, operand),
@@ -203,12 +205,24 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                 OperandType.ShortInlineVar => bytes.Take<byte>(),
                 OperandType.InlineVar => bytes.Take<ushort>(),
 
-                OperandType.InlineSwitch => bytes.Take<uint>(),
+                OperandType.InlineSwitch => ParseOperandSwitch(ref bytes),
 
                 OperandType.InlinePhi => throw new NotSupportedException(),
 
                 _ => throw new InvalidOperationException(),
             };
+        }
+
+        private int[] ParseOperandSwitch(ref ReadOnlyStreamSpan<byte> bytes)
+        {
+            // CMA-335 6th Edition / June 2012 -> III.3.66
+            // First four bytes are unsigned int32 for length, remaining bytes are signed int32s for jump targets
+            var count = bytes.Take<uint>();
+            var targets = new int[count];
+            for (var i = 0; i < count; i++)
+                targets[i] = bytes.Take<int>();
+
+            return targets;
         }
 
         private string ParseOperandString(ref ReadOnlyStreamSpan<byte> bytes, Module module)
