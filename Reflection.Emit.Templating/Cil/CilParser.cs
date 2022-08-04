@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Runtime.InteropServices;
 
 using Microsoft.Extensions.Logging;
 
@@ -53,6 +54,11 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                 return label;
             }
 
+            var genericContext = new GenericContext(
+                typeArguments: method.DeclaringType.GenericTypeArguments,
+                methodArguments: method.GetGenericArguments()
+            );
+
             var address = 0;
             var lastBytesLength = bytes.Length;
             while (bytes.Length > 0)
@@ -61,7 +67,7 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                 lastBytesLength = bytes.Length;
 
                 var opCode = ParseOpCode(ref bytes);
-                var operand = ParseOperand(opCode, ref bytes, method.Module);
+                var operand = ParseOperand(opCode, ref bytes, method.Module, genericContext);
 
                 // Calculate address of next instruction for branches
                 var nextAddress = address + lastBytesLength - bytes.Length;
@@ -166,8 +172,9 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
                 throw new InvalidOperationException();
         }
 
-        private object? ParseOperand(OpCode opCode, ref ReadOnlyStreamSpan<byte> bytes, Module module)
+        private object? ParseOperand(OpCode opCode, ref ReadOnlyStreamSpan<byte> bytes, Module module, GenericContext genericContext)
         {
+            // CMA-335 6th Edition / June 2012 -> VI.C.2
             return opCode.OperandType switch
             {
                 OperandType.InlineNone => null,
@@ -186,17 +193,17 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
 
                 OperandType.InlineString => ParseOperandString(ref bytes, module),
 
-                OperandType.InlineType => ParseOperandType(ref bytes, module),
-                OperandType.InlineField => ParseOperandField(ref bytes, module),
-                OperandType.InlineMethod => ParseOperandMethod(ref bytes, module),
+                OperandType.InlineType => ParseOperandType(ref bytes, module, genericContext),
+                OperandType.InlineField => ParseOperandField(ref bytes, module, genericContext),
+                OperandType.InlineMethod => ParseOperandMethod(ref bytes, module, genericContext),
                 OperandType.InlineSig => ParseOperandSignature(ref bytes, module),
+
+                OperandType.InlineTok => ParseOperandMetadataToken(ref bytes, module, genericContext),
 
                 OperandType.ShortInlineVar => bytes.Take<byte>(),
                 OperandType.InlineVar => bytes.Take<ushort>(),
 
                 OperandType.InlineSwitch => bytes.Take<uint>(),
-
-                OperandType.InlineTok => ParseOperandMetadataToken(ref bytes, module),
 
                 OperandType.InlinePhi => throw new NotSupportedException(),
 
@@ -210,53 +217,82 @@ namespace MrHotkeys.Reflection.Emit.Templating.Cil
             return module.ResolveString(token);
         }
 
-        private Type ParseOperandType(ref ReadOnlyStreamSpan<byte> bytes, Module module)
+        private Type ParseOperandType(ref ReadOnlyStreamSpan<byte> bytes, Module module, GenericContext genericContext)
         {
-            var token = bytes.Take<int>();
-            return module.ResolveType(token);
+            return module.ResolveType(
+                metadataToken: bytes.Take<int>(),
+                genericTypeArguments: genericContext.TypeArguments,
+                genericMethodArguments: genericContext.MethodArguments
+            );
         }
 
-        private FieldInfo ParseOperandField(ref ReadOnlyStreamSpan<byte> bytes, Module module)
+        private FieldInfo ParseOperandField(ref ReadOnlyStreamSpan<byte> bytes, Module module, GenericContext genericContext)
         {
-            var token = bytes.Take<int>();
-            return module.ResolveField(token);
+            return module.ResolveField(
+                metadataToken: bytes.Take<int>(),
+                genericTypeArguments: genericContext.TypeArguments,
+                genericMethodArguments: genericContext.MethodArguments
+            );
         }
 
-        private MethodBase ParseOperandMethod(ref ReadOnlyStreamSpan<byte> bytes, Module module)
+        private MethodBase ParseOperandMethod(ref ReadOnlyStreamSpan<byte> bytes, Module module, GenericContext genericContext)
         {
-            var token = bytes.Take<int>();
-            return module.ResolveMethod(token);
+            return module.ResolveMethod(
+                metadataToken: bytes.Take<int>(),
+                genericTypeArguments: genericContext.TypeArguments,
+                genericMethodArguments: genericContext.MethodArguments
+            );
+        }
+
+        private MemberInfo ParseOperandMemberRef(ref ReadOnlyStreamSpan<byte> bytes, Module module, GenericContext genericContext)
+        {
+            return module.ResolveMember(
+                metadataToken: bytes.Take<int>(),
+                genericTypeArguments: genericContext.TypeArguments,
+                genericMethodArguments: genericContext.MethodArguments
+            );
         }
 
         private byte[] ParseOperandSignature(ref ReadOnlyStreamSpan<byte> bytes, Module module)
         {
-            Logger.LogWarning($"Resolving signature as {typeof(byte[]).Name} at position {bytes.Position} - writing  is unsupported unless converted to {nameof(SignatureHelper)}!");
+            Logger.LogWarning($"Resolving signature as {typeof(byte[]).Name} at position {bytes.Position} - writing is unsupported unless converted to {nameof(SignatureHelper)}!");
 
             var token = bytes.Take<int>();
             return module.ResolveSignature(token);
         }
 
-        private MemberInfo ParseOperandMember(ref ReadOnlyStreamSpan<byte> bytes, Module module)
+        private object ParseOperandMetadataToken(ref ReadOnlyStreamSpan<byte> bytes, Module module, GenericContext genericContext)
         {
-            var token = bytes.Take<int>();
-            return module.ResolveMember(token);
-        }
-
-        private object ParseOperandMetadataToken(ref ReadOnlyStreamSpan<byte> bytes, Module module)
-        {
-            // Most significant byte of token defines type
-            var mostSignificantByteIndex = BitConverter.IsLittleEndian ? 3 : 0;
-            var tokenType = (CilMetadataTokenType)bytes[mostSignificantByteIndex];
-            return tokenType switch
+            return GetMetadataTokenType(ref bytes) switch
             {
-                CilMetadataTokenType.Type => ParseOperandType(ref bytes, module),
-                CilMetadataTokenType.Field => ParseOperandField(ref bytes, module),
-                CilMetadataTokenType.Method => ParseOperandMethod(ref bytes, module),
-                CilMetadataTokenType.Member => ParseOperandMember(ref bytes, module),
-                CilMetadataTokenType.Signature => ParseOperandSignature(ref bytes, module),
+                CilMetadataTokenType.Field => ParseOperandField(ref bytes, module, genericContext),
+                CilMetadataTokenType.MemberRef => ParseOperandMemberRef(ref bytes, module, genericContext),
+                CilMetadataTokenType.MethodDef => ParseOperandMethod(ref bytes, module, genericContext),
+                CilMetadataTokenType.StandAloneSig => ParseOperandSignature(ref bytes, module),
                 CilMetadataTokenType.String => ParseOperandString(ref bytes, module),
+                CilMetadataTokenType.TypeRef => ParseOperandType(ref bytes, module, genericContext),
                 _ => throw new NotSupportedException(),
             };
+        }
+
+        private CilMetadataTokenType GetMetadataTokenType(ref ReadOnlyStreamSpan<byte> bytes)
+        {
+            // Most significant byte of token defines type
+            var index = BitConverter.IsLittleEndian ? 3 : 0;
+            return (CilMetadataTokenType)bytes[index];
+        }
+
+        private sealed class GenericContext
+        {
+            public Type[] TypeArguments { get; }
+
+            public Type[] MethodArguments { get; }
+
+            public GenericContext(Type[] typeArguments, Type[] methodArguments)
+            {
+                TypeArguments = typeArguments ?? throw new ArgumentNullException(nameof(typeArguments));
+                MethodArguments = methodArguments ?? throw new ArgumentNullException(nameof(methodArguments));
+            }
         }
     }
 }
